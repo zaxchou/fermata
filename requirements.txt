@@ -1,0 +1,12 @@
+# Runtime dependencies.
+# Versions below are the ones this was developed and tested against; the
+# >= bounds are deliberately loose so a fresh install does not dead-end on
+# a resolver conflict.
+sounddevice>=0.5.6      # PortAudio bindings -- opens the output stream
+numpy>=2.5.3            # signal generation
+pywebview>=6.2.1        # settings window (WebView2 on Windows)
+pystray>=0.19.5         # tray icon
+pillow>=12.3.0          # icon rendering
+
+# Only needed to build the packaged EXE (see Fermata.spec).
+pyinstaller>=6.22.3

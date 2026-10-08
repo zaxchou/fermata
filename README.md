@@ -128,11 +128,15 @@ probably what you want.
 ## Building from source
 
 ```
-pip install sounddevice numpy pywebview pystray pillow pyinstaller
+pip install -r requirements.txt
 
 pyinstaller --noconfirm --clean Fermata.spec
 # -> dist\Fermata\
 ```
+
+Python 3.11 or newer. On Windows the settings window uses the WebView2 runtime;
+it ships with Windows 11 and with current Windows 10 builds, and otherwise
+installs from Microsoft as a small standalone package.
 
 Run without packaging:
 
