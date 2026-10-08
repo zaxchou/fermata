@@ -10,8 +10,6 @@ from __future__ import annotations
 import os
 from PIL import Image, ImageDraw
 
-from .paths import bundle_dir
-
 TRAY_GREEN = (21, 163, 74, 255)
 TRAY_AMBER = (217, 119, 6, 255)
 TRAY_RED = (220, 38, 38, 255)
@@ -59,7 +57,16 @@ def make_image(size: int = 64, color: tuple = TRAY_GREEN) -> Image.Image:
 
 
 def write_ico(path: str) -> bool:
-    """Write a multi-resolution .ico for the EXE."""
+    """Write a multi-resolution .ico for the EXE.
+
+    Run this to regenerate `assets/icon.ico`, which is committed and picked up
+    by Fermata.spec as the EXE's icon:
+
+        python -c "from app.core import icon; icon.write_ico('assets/icon.ico')"
+
+    The file has to be on disk for the build; it is not needed at runtime, which
+    is why nothing loads it back.
+    """
     try:
         base = make_image(256, TRAY_SLATE)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -69,7 +76,3 @@ def write_ico(path: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def ico_path() -> str:
-    return os.path.join(bundle_dir(), "assets", "icon.ico")

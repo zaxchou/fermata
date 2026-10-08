@@ -17,7 +17,6 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join("app", "ui", "index.html"), "ui"),
-        (os.path.join("assets", "icon.ico"), "assets"),
     ],
     # pywebview and pystray pick their platform backend at runtime, so the
     # static import graph never mentions them.

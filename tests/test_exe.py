@@ -10,12 +10,12 @@ Assumes nothing. Verifies the frozen build the way a user would exercise it:
      packaging -- the classic silent breakage
 """
 import ctypes
-import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import winreg
 from ctypes import wintypes
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,11 +89,51 @@ def run_reg_query() -> str:
     return r.stdout.strip()
 
 
+# The Run key is per-user and global, so this test cannot isolate it the way it
+# isolates the data directory. Snapshot it and put it back: without this, simply
+# running the suite cleared the developer's own autostart entry and left it
+# pointing at this build's dist folder.
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_VALUE = "Fermata"
+
+
+def read_run_entry() -> tuple[bool, str]:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, _RUN_VALUE)
+            return True, str(value)
+    except OSError:
+        return False, ""
+
+
+def restore_run_entry(existed: bool, value: str) -> str:
+    """Put the Run entry back. Returns a status line for the report."""
+    try:
+        if existed:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, _RUN_VALUE, 0, winreg.REG_SZ, value)
+            return f"restored the original Run entry: {value}"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, _RUN_VALUE)
+            except FileNotFoundError:
+                pass
+        return "removed the Run entry this test created"
+    except OSError as exc:
+        return (f"!! could not restore the Run entry ({exc}); it still points "
+                f"at this build")
+
+
 print("EXE:", EXE)
 if not os.path.exists(EXE):
     print("!! EXE not built")
     sys.exit(1)
 print("size: %.1f MB" % (os.path.getsize(EXE) / 1048576))
+
+_had_entry, _prev_value = read_run_entry()
+print(f"run entry before: {'(present) ' + _prev_value if _had_entry else '(absent)'}")
 
 kill_stale()
 
@@ -189,8 +229,15 @@ check("Run entry carries --minimized", "--minimized" in value, value)
 kill_stale()
 
 print()
+print(restore_run_entry(_had_entry, _prev_value))
+
+print()
 print("=" * 60)
 bad = [n for n, ok in results if not ok]
 print(f"{len(results) - len(bad)}/{len(results)} checks passed")
 print("FAILED: " + ", ".join(bad) if bad else "ALL EXE CHECKS PASSED")
 print("=" * 60)
+
+# Exit non-zero on failure, so an automated run cannot report success for a
+# build that did not actually work.
+sys.exit(1 if bad else 0)

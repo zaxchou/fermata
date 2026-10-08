@@ -23,11 +23,10 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
-def launch_command(start_minimized: bool = True) -> str:
-    """The exact command line to store in the Run key."""
-    args = " --minimized" if start_minimized else ""
+def launch_target() -> str:
+    """The program to launch, without the --minimized flag."""
     if _is_frozen():
-        return f'"{sys.executable}"{args}'
+        return f'"{sys.executable}"'
 
     # Source mode: prefer pythonw.exe so no console window flashes at logon.
     exe_dir = os.path.dirname(sys.executable)
@@ -36,11 +35,39 @@ def launch_command(start_minimized: bool = True) -> str:
         pythonw = sys.executable
     entry = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "main.py")
-    return f'"{pythonw}" "{entry}"{args}'
+    return f'"{pythonw}" "{entry}"'
+
+
+def launch_command(start_minimized: bool = True) -> str:
+    """The exact command line to store in the Run key."""
+    args = " --minimized" if start_minimized else ""
+    return launch_target() + args
+
+
+def _without_flags(command: str) -> str:
+    return command.strip().removesuffix("--minimized").strip()
+
+
+def is_ours() -> bool:
+    """True when the Run entry launches *this* program, ignoring its flags.
+
+    Comparing whole command lines instead is what made the "start minimized"
+    checkbox unable to reach the registry: the stored entry only carries
+    --minimized when the setting was on, so an entry written the other way
+    looked like somebody else's and was left alone.
+    """
+    if not is_enabled():
+        return False
+    return _without_flags(current_value()) == launch_target()
 
 
 def is_enabled() -> bool:
-    """True if our Run entry exists and matches what we would write now."""
+    """True if our Run entry exists.
+
+    Note "exists", not "is correct": a stale entry pointing at a moved install
+    still counts as enabled, which is what the UI checkbox should reflect.
+    should_refresh() answers the other question.
+    """
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
@@ -90,8 +117,8 @@ def disable() -> tuple[bool, str]:
         return False, str(exc)
 
 
-def should_refresh() -> bool:
-    """True when the stored entry should be repointed at where we are now.
+def should_refresh(start_minimized: bool = True) -> bool:
+    """True when the stored entry should be rewritten: wrong target or wrong flags.
 
     The direction matters, and getting it wrong breaks an installed product:
 
@@ -101,12 +128,15 @@ def should_refresh() -> bool:
                            development or testing) must never steal autostart
                            from an installed build and point the login entry at
                            a source directory that may move or be deleted.
+
+    Flags count too: turning "start minimized" off has to reach the registry,
+    otherwise the checkbox and the login behaviour disagree.
     """
     if not is_enabled():
         return False
 
     current = current_value().strip()
-    if current == launch_command().strip():
+    if current == launch_command(start_minimized).strip():
         return False
 
     if not _is_frozen():

@@ -23,7 +23,6 @@ import argparse
 import ctypes
 import logging
 import os
-
 import sys
 import threading
 import time
@@ -43,7 +42,12 @@ APP_TITLE = "Fermata"
 SINGLETON_MUTEX = "Global\\FermataApp"
 ERROR_ALREADY_EXISTS = 183
 
-log = logging.getLogger("keepalive")
+# Settings that change what comes out of the speaker. Everything else (language,
+# tray behaviour, autostart) can be applied without interrupting the stream.
+AUDIO_KEYS = ("device_hint", "signal_type", "level_dbfs", "freq_hz",
+              "sample_rate")
+
+log = logging.getLogger("fermata")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -134,13 +138,6 @@ class Api:
             log.warning("open folder failed: %s", exc)
             return False
 
-    def hide_window(self) -> bool:
-        return self._app.hide_window()
-
-    def quit(self) -> bool:
-        self._app.request_quit()
-        return True
-
 
 # --------------------------------------------------------------------------
 # application
@@ -172,36 +169,32 @@ class Application:
 
         Three cases, and the direction of each matters:
 
-          missing but wanted    restore it. Without this, anything that clears
-                                the entry behind our back (cleanup utilities,
-                                a profile reset) silently turns off launch-at-login
-                                while the checkbox still reads "on".
-          present but stale     repoint it. Typical after the app is packaged or
-                                moved: the Run key still aims at the old path.
-          present and unwanted  remove it -- but only if the entry is ours.
-                                Running from source must never delete an
-                                installed build's entry.
+          wanted, missing or wrong   create, restore or repoint it. Without this,
+                                     anything that clears the entry behind our
+                                     back (cleanup utilities, a profile reset)
+                                     silently turns off launch-at-login while the
+                                     checkbox still reads "on"; and an entry left
+                                     over from a source run keeps pointing at a
+                                     tree that may have moved.
+          present and unwanted       remove it -- but only if the entry is ours.
+                                     Running from source must never delete an
+                                     installed build's entry.
         """
         wanted = bool(self.settings.get("launch_at_login"))
         minimized = bool(self.settings.get("start_minimized", True))
         present = autostart.is_enabled()
-        ours = autostart.current_value().strip() == autostart.launch_command().strip()
 
-        if wanted and not present:
+        if wanted and (not present or autostart.should_refresh(minimized)):
             ok, val = autostart.enable(minimized)
-            log.info("autostart was missing; restored -> %s (%s)", val, ok)
+            log.info("autostart %s -> %s (%s)",
+                     "restored" if not present else "repointed", val, ok)
             return
 
-        if wanted and present and autostart.should_refresh():
-            ok, val = autostart.enable(minimized)
-            self.settings["launch_at_login"] = True
-            settings_mod.save(self.settings)
-            log.info("migrated autostart entry -> %s (%s)", val, ok)
-            return
-
-        if not wanted and present and ours:
-            ok, val = autostart.disable()
-            log.info("autostart disabled (it was ours) -> %s", ok)
+        # `is_ours` rather than a whole-command comparison, so an entry written
+        # without --minimized is still recognised as ours and can be removed.
+        if not wanted and present and autostart.is_ours():
+            ok, _ = autostart.disable()
+            log.info("autostart disabled (the entry was ours) -> %s", ok)
 
     # -- engine ---------------------------------------------------------
 
@@ -218,6 +211,7 @@ class Application:
     # -- settings -------------------------------------------------------
 
     def apply_settings(self, incoming: dict) -> dict:
+        before = dict(self.settings)
         merged = dict(self.settings)
         merged.update(incoming)
 
@@ -239,11 +233,17 @@ class Application:
             log.info("language changed to %s", new_language)
         self._sync_tray(force=True)
 
-        # Apply audio changes immediately rather than waiting for a restart.
-        if was_running:
+        # Only an audio setting justifies restarting the stream. Restarting on
+        # every save meant that picking a language cut the signal briefly -- and
+        # with it the very thing the app exists to provide.
+        changed = [k for k in AUDIO_KEYS if self.settings.get(k) != before.get(k)]
+        if was_running and changed:
+            log.info("audio settings changed (%s); restarting the stream",
+                     ", ".join(sorted(changed)))
             self.engine.stop()
             self.start_engine()
-        log.info("settings saved (engine was running: %s)", was_running)
+        log.info("settings saved (engine was running: %s, audio changed: %s)",
+                 was_running, bool(changed))
         return {"ok": True, "message": "saved"}
 
     def set_autostart(self, enabled: bool) -> dict:

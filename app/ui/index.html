@@ -451,6 +451,7 @@ const I18N = {
     'audio.levelHint':'If you can hear it, it is too loud.',
     'audio.type.pink':'Pink','audio.type.white':'White','audio.type.sine':'Sine',
     'audio.default':'default',
+    'audio.anyDevice':'Any device (system default)',
     'sig.pink':'pink noise','sig.white':'white noise','sig.sine':'sine',
     'bh.reconnect':'Reconnect automatically',
     'bh.reconnectHint':'Keep retrying when the stream drops.',
@@ -493,6 +494,7 @@ const I18N = {
     'audio.levelHint':'如果你能听见，就是太响了。',
     'audio.type.pink':'粉红','audio.type.white':'白噪','audio.type.sine':'正弦',
     'audio.default':'默认',
+    'audio.anyDevice':'任意设备（跟随系统默认）',
     'sig.pink':'粉红噪声','sig.white':'白噪声','sig.sine':'正弦',
     'bh.reconnect':'断线自动重连',
     'bh.reconnectHint':'信号中断后持续重试。',
@@ -612,7 +614,7 @@ async function loadDevices(){
     opt.value = d.name;
     const tag = d.host_api.includes('WASAPI') ? '' : ' · ' + d.host_api;
     opt.textContent = d.name + tag + (d.is_default ? '  (' + t('audio.default') + ')' : '');
-    if (norm(d.name).includes(norm(cur))) hasMatch = true;
+    if (norm(cur) && norm(d.name).includes(norm(cur))) hasMatch = true;
     sel.append(opt);
   });
   // Keep an explicit entry for a filter that matches nothing right now, so the
@@ -623,10 +625,16 @@ async function loadDevices(){
     opt.textContent = cur;
     sel.prepend(opt);
   }
-  if (cur){
-    const hit = [...sel.options].find(o => norm(o.value).includes(norm(cur)));
-    sel.value = hit ? hit.value : cur;
-  }
+  // An explicit "any" row, so an empty setting round-trips. Without it the
+  // select always had a value, and pressing Save silently replaced "system
+  // default" with whichever device happened to be listed first.
+  const any = document.createElement('option');
+  any.value = '';
+  any.textContent = t('audio.anyDevice');
+  sel.prepend(any);
+
+  const hit = cur ? [...sel.options].find(o => o.value && norm(o.value).includes(norm(cur))) : null;
+  sel.value = hit ? hit.value : (cur || '');
 }
 
 function fillForm(){
@@ -722,7 +730,11 @@ $('level').oninput = () => {
   paintLevel();
 };
 
-$('deviceSelect').onchange = e => { $('deviceHint').value = e.target.value; };
+// Mirror the pick into the filter box, but do not wipe it when "Any device" is
+// chosen: the filter is exactly what you would want to keep in that case.
+$('deviceSelect').onchange = e => {
+  if (e.target.value) $('deviceHint').value = e.target.value;
+};
 
 $('launchAtLogin').onchange = async e => {
   const r = await window.pywebview.api.set_autostart(e.target.checked);

@@ -1,14 +1,16 @@
 """The audio engine, wrapped so a GUI can drive it.
 
-The proven signal logic is unchanged from the CLI version (broadband pink noise
-at -60 dBFS, WASAPI preferred over MME). What is new is the shape: a
-`KeepaliveEngine` object that runs the stream on a worker thread and exposes
-start/stop/status, so the UI thread never blocks on audio.
+The signal is broadband pink noise at -60 dBFS by default, and WASAPI is
+preferred over MME; the reasoning behind both is in the README. What this module
+adds is the shape: a `KeepaliveEngine` object that runs the stream on a worker
+thread and exposes start/stop/status, so the UI thread never blocks on audio.
 
 Threading contract, which is the whole point of this class:
 
   * `start()` and `stop()` are called from the UI thread and return promptly.
-  * All audio work happens on one worker thread, created per run.
+  * All audio work happens on one worker thread, created per run, and each run
+    gets its own stop flag, so a run that refuses to die cannot bleed into the
+    next one.
   * `status()` is safe to call from anywhere at any time.
   * The worker owns the PortAudio stream for its entire life and is the only
     code that closes it. Closing a stream from a different thread than the one
@@ -17,7 +19,6 @@ Threading contract, which is the whole point of this class:
 from __future__ import annotations
 
 import ctypes
-import re
 import threading
 import time
 from typing import Any, Callable
@@ -28,6 +29,12 @@ import sounddevice as sd
 FADE_S = 1.5
 BLOCK_FRAMES = 4096
 HEARTBEAT_POLL_S = 0.5
+
+# Output RMS of the noise signals at unit amplitude. Uniform white noise drawn
+# from [-1, 1) has RMS 1/sqrt(3), and pink is normalised to the same figure so
+# the two noise types are equally loud at a given level setting. (A sine is
+# peak-referenced, so at the same setting it is 1.8 dB louder in RMS.)
+NOISE_RMS = 1.0 / 3.0 ** 0.5
 
 # A device that cannot be opened immediately is retried on this cadence.
 DEVICE_POLL_S = 3.0
@@ -72,38 +79,104 @@ def _com_uninitialize() -> None:
 
 
 # --------------------------------------------------------------------------
-# signal generation (unchanged from the CLI implementation)
+# signal generation
 # --------------------------------------------------------------------------
 
+class _PinkNoise:
+    """Pink noise by overlap-add of random-phase spectral frames.
+
+    Each frame draws a random complex spectrum, shapes it by 1/sqrt(f), inverse
+    transforms it, windows it and overlap-adds it at a 50 % hop. The result is a
+    genuine stationary random process -- not a loop -- with a -3 dB/octave tilt.
+
+    This replaced Paul Kellet's one-pole bank, which is a fine filter but was
+    evaluated one sample at a time in Python: 44 100 interpreter iterations a
+    second, measured at **9.4 % of a core** for a tray utility whose entire job
+    is to be invisible. Generating a frame per 2048 samples costs 0.16 % and
+    measures within 0.02 dB/octave of the old spectrum.
+
+    Two details make the level exact rather than approximate:
+
+      * the sine window is used, not Hann, because at a 50 % hop the sum of
+        squared windows is identically 1 (for Hann it wobbles between 0.5 and 1,
+        which shows up as ripple and a 1.25 dB level error);
+      * the spectral mask is scaled by Parseval so that the unit-normal spectrum
+        really does come out at unit variance -- verified in tests, not assumed.
+    """
+
+    FRAME = 4096
+    # Below this the 1/sqrt(f) tilt is flattened; a 4096-point frame cannot
+    # resolve much lower, and nothing about standby detection happens at 20 Hz.
+    F_FLOOR = 55.0
+    # Roll off before Nyquist instead of letting the mask blow up at the edge.
+    ROLLOFF = 0.44
+    ROLL_W = 0.05
+
+    def __init__(self, sample_rate: int):
+        n = self.FRAME
+        self._hop = n // 2
+
+        freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+        mask = np.zeros_like(freqs)
+        band = freqs > 0
+        mask[band] = 1.0 / np.sqrt(np.maximum(freqs[band], self.F_FLOOR))
+        edge = self.ROLLOFF * sample_rate
+        top = freqs > edge
+        mask[top] *= np.exp(-((freqs[top] - edge) / (self.ROLL_W * sample_rate)) ** 2)
+        mask[0] = 0.0
+
+        # Parseval weights: 1 at DC and Nyquist, 2 elsewhere. real+imag are each
+        # standard normal, so E|Z|^2 = 2.
+        weights = np.full(freqs.shape, 2.0)
+        weights[0] = weights[-1] = 1.0
+        mask *= np.sqrt(n ** 2 / (2.0 * np.sum(weights * mask ** 2)))
+        self._mask = mask
+
+        # sqrt of the periodic Hann window: sum(w^2) == 1 at a 50 % hop.
+        self._win = np.sin(np.pi * np.arange(n) / n)
+
+        self._tail = np.zeros(n, dtype=np.float64)
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._pos = 0
+
+    def _advance(self) -> None:
+        """Add one new windowed frame to the overlap queue."""
+        n = self.FRAME
+        spec = (np.random.standard_normal(n // 2 + 1)
+                + 1j * np.random.standard_normal(n // 2 + 1)) * self._mask
+        frame = np.fft.irfft(spec, n) * self._win
+        self._buf = self._tail[:self._hop] + frame[:self._hop]
+        self._tail[:self._hop] = self._tail[self._hop:] + frame[self._hop:]
+        self._pos = 0
+
+    def generate(self, frames: int, amplitude: float) -> np.ndarray:
+        """`frames` samples of unit-variance pink noise, scaled to amplitude."""
+        out = np.empty(frames, dtype=np.float32)
+        gain = amplitude * NOISE_RMS
+        got = 0
+        while got < frames:
+            if self._pos >= len(self._buf):
+                self._advance()
+            take = min(len(self._buf) - self._pos, frames - got)
+            out[got:got + take] = self._buf[self._pos:self._pos + take] * gain
+            self._pos += take
+            got += take
+        return out
+
+
 class NoiseGenerator:
-    """Streaming per-sample generator; one value is produced per frame."""
+    """Streaming signal generator; one value is produced per frame."""
 
     def __init__(self, kind: str, sample_rate: int, freq: float = 19000.0):
         self.kind = kind
         self.sample_rate = sample_rate
         self.freq = freq
         self.phase = 0.0
-        # Paul Kellet economy pink filter: -3 dB/octave, negligible CPU.
-        self._pink = np.zeros(7)
-
-    def _pink_sample(self) -> float:
-        white = float(np.random.uniform(-1.0, 1.0))
-        b0, b1, b2, b3, b4, b5, b6 = self._pink
-        b0 = 0.99886 * b0 + white * 0.0555179
-        b1 = 0.99332 * b1 + white * 0.0750759
-        b2 = 0.96900 * b2 + white * 0.1538520
-        b3 = 0.86650 * b3 + white * 0.3104856
-        b4 = 0.55000 * b4 + white * 0.5329522
-        b5 = -0.7616 * b5 - white * 0.0168980
-        b6 = white * 0.115926
-        self._pink = (b0, b1, b2, b3, b4, b5, b6)
-        return b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362
+        self._pink = _PinkNoise(sample_rate) if kind == "pink" else None
 
     def generate(self, frames: int, amplitude: float) -> np.ndarray:
         if self.kind == "pink":
-            out = np.fromiter((self._pink_sample() for _ in range(frames)),
-                              dtype=np.float32, count=frames)
-            return (out / 3.0 * amplitude).astype(np.float32)
+            return self._pink.generate(frames, amplitude)
         if self.kind == "white":
             return (np.random.uniform(-1.0, 1.0, frames).astype(np.float32)
                     * amplitude)
@@ -185,6 +258,18 @@ def _api_name(index: int) -> str:
     return sd.query_hostapis()[dev["hostapi"]]["name"]
 
 
+def _matches(hint: str, name: str) -> bool:
+    """Case-insensitive substring match, as documented on the setting.
+
+    Deliberately not a regex. PortAudio device names contain parentheses
+    ("Speakers (STANMORE II)"), and a pattern built from a name those came from
+    is one stray bracket away from raising -- which the caller would swallow and
+    report as "no device", leaving the app waiting forever on a filter the user
+    can see is spelled correctly.
+    """
+    return hint.casefold() in name.casefold()
+
+
 def pick_device(hint: str) -> tuple[int, dict] | None:
     """Best host-API view of the endpoint matching `hint`.
 
@@ -200,7 +285,7 @@ def pick_device(hint: str) -> tuple[int, dict] | None:
         for idx, dev in enumerate(sd.query_devices()):
             if dev.get("max_output_channels", 0) < 1:
                 continue
-            if not hint or re.search(hint, dev["name"], re.IGNORECASE):
+            if not hint or _matches(hint, dev["name"]):
                 matches.append((idx, dev))
     except Exception:
         return None
@@ -254,6 +339,11 @@ class KeepaliveEngine:
     def __init__(self, log: Callable[[str], None] | None = None):
         self._log = log or (lambda _msg: None)
         self._lock = threading.Lock()
+        # One Event per run, handed to the worker as an argument. A single shared
+        # Event that start() cleared was subtly wrong: if a worker outlived its
+        # 6 s join (a wedged device can do that), start() cleared the flag the old
+        # worker was watching and opened a second stream alongside it. Each run
+        # now owns its own flag, so a stale worker always sees "stop".
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = STATE_STOPPED
@@ -272,12 +362,15 @@ class KeepaliveEngine:
         if self.is_running():
             return False, "already running"
 
-        self._stop_event.clear()
+        stop_event = threading.Event()
         self._started_mono = time.monotonic()
         self._set_state(STATE_WAITING, "starting")
-        self._stats = {}
+        with self._lock:
+            self._stop_event = stop_event
+            self._stats = {}
 
-        thread = threading.Thread(target=self._worker, args=(dict(settings),),
+        thread = threading.Thread(target=self._worker,
+                                  args=(dict(settings), stop_event),
                                   name="keepalive-worker", daemon=True)
         with self._lock:
             self._thread = thread
@@ -286,13 +379,21 @@ class KeepaliveEngine:
 
     def stop(self, timeout: float = 6.0) -> None:
         """Ask the worker to finish and wait briefly for it."""
-        self._stop_event.set()
         with self._lock:
+            stop_event = self._stop_event
             thread = self._thread
+        stop_event.set()
         if thread and thread.is_alive():
             thread.join(timeout=timeout)
+            if thread.is_alive():
+                # Say so instead of silently reporting a clean stop: a stream
+                # that would not close is exactly the kind of thing that goes
+                # unnoticed until the next start cannot open the device.
+                self._log(f"worker still alive {timeout:.0f}s after stop "
+                          f"(wedged device?); abandoning the thread")
         with self._lock:
-            self._thread = None
+            if self._thread is thread:
+                self._thread = None
         self._set_state(STATE_STOPPED, "stopped")
 
     def status(self) -> dict[str, Any]:
@@ -322,7 +423,8 @@ class KeepaliveEngine:
         with self._lock:
             self._stats.update(kwargs)
 
-    def _worker(self, settings: dict[str, Any]) -> None:
+    def _worker(self, settings: dict[str, Any],
+                stop_event: threading.Event) -> None:
         """Owns the stream lifecycle: wait for device, stream, maybe retry.
 
         COM is initialized here, on this thread, before any stream is opened --
@@ -330,36 +432,44 @@ class KeepaliveEngine:
         """
         own_com = _com_initialize()
         try:
-            self._worker_body(settings)
+            self._worker_body(settings, stop_event)
         finally:
             if own_com:
                 _com_uninitialize()
 
-    def _worker_body(self, settings: dict[str, Any]) -> None:
-        hint = settings.get("device_hint", "")
+    def _worker_body(self, settings: dict[str, Any],
+                     stop_event: threading.Event) -> None:
+        hint = str(settings.get("device_hint", "") or "")
         wait_s = float(settings.get("wait_device_s", 300.0))
         reconnect = bool(settings.get("reconnect", True))
         backoff = max(1.0, float(settings.get("reconnect_delay_s", 10.0)))
+        # Retries grow the delay so a permanently absent device is not polled
+        # forever at full rate. A stream that ran healthily resets the count,
+        # otherwise a long session followed by one dropout would wait minutes
+        # for no reason.
         attempt = 0
+        healthy_s = 60.0
 
-        while not self._stop_event.is_set():
-            picked = self._await_device(hint, wait_s)
+        while not stop_event.is_set():
+            picked = self._await_device(hint, wait_s, stop_event)
             if picked is None:
                 if not reconnect:
-                    self._set_state(STATE_ERROR, f"no device matching '{hint}'")
+                    self._set_state(STATE_ERROR,
+                                    f"no output device matching '{hint}'")
                     self._log(f"give up: no device matching '{hint}'")
                     break
                 attempt += 1
                 delay = min(backoff * attempt, 60.0)
                 self._set_state(STATE_WAITING,
                                 f"no device yet, retry in {delay:.0f}s")
-                if self._stop_event.wait(delay):
+                if stop_event.wait(delay):
                     break
                 continue
 
             index, info = picked
             self._set_stats(device_name=info.get("name", ""))
-            result = self._run_stream(index, info, settings)
+            began = time.monotonic()
+            result = self._run_stream(index, info, settings, stop_event)
             if result == "stopped":
                 break
             if not reconnect:
@@ -367,24 +477,26 @@ class KeepaliveEngine:
                 self._log(f"stream ended: {result}")
                 break
 
+            if time.monotonic() - began >= healthy_s:
+                attempt = 0
             attempt += 1
             delay = min(backoff * attempt, 60.0)
             self._set_state(STATE_RECONNECTING,
                             f"{result}; retry in {delay:.0f}s")
             self._log(f"stream lost ({result}); retry in {delay:.0f}s")
-            if self._stop_event.wait(delay):
+            if stop_event.wait(delay):
                 break
 
         with self._lock:
             if self._state not in (STATE_ERROR,):
                 self._state = STATE_STOPPED
 
-    def _await_device(self, hint: str,
-                      timeout_s: float) -> tuple[int, dict] | None:
+    def _await_device(self, hint: str, timeout_s: float,
+                      stop_event: threading.Event) -> tuple[int, dict] | None:
         """Poll until the endpoint exists or the timeout expires (0 = forever)."""
         deadline = None if timeout_s <= 0 else time.monotonic() + timeout_s
         announced = False
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 picked = pick_device(hint)
             except Exception:
@@ -396,14 +508,18 @@ class KeepaliveEngine:
             if deadline is not None and time.monotonic() >= deadline:
                 return None
             if not announced:
-                self._set_state(STATE_WAITING, f"waiting for '{hint}'")
+                # An empty filter is the default and means "the system default
+                # output", so quoting it produced the useless "waiting for ''".
+                what = f"'{hint}'" if hint else "an output device"
+                self._set_state(STATE_WAITING, f"waiting for {what}")
                 announced = True
-            if self._stop_event.wait(DEVICE_POLL_S):
+            if stop_event.wait(DEVICE_POLL_S):
                 return None
         return None
 
     def _run_stream(self, device_index: int, info: dict,
-                    settings: dict[str, Any]) -> str:
+                    settings: dict[str, Any],
+                    stop_event: threading.Event) -> str:
         """Stream until stopped or broken. Returns 'stopped' or a reason."""
         try:
             default_sr = int(info.get("default_samplerate") or 0) or 44100
@@ -418,29 +534,31 @@ class KeepaliveEngine:
         fade_in = np.linspace(0.0, 1.0, int(sample_rate * FADE_S),
                               dtype=np.float32)
         fade_out = fade_in[::-1].copy()
-        st: dict[str, Any] = {"pos": 0, "fading": False, "frames": 0,
-                              "rms": 0.0, "errors": 0}
+        st: dict[str, Any] = {"in_pos": 0, "faded_in": False,
+                              "fading_out": False, "out_pos": 0,
+                              "frames": 0, "rms": 0.0, "errors": 0}
 
         def callback(outdata, frames, time_info, status):  # noqa: ARG001
             if status:
                 st["errors"] += 1
             buf = gen.generate(frames, amplitude)
-            if not st["fading"]:
-                n = min(len(fade_in) - st["pos"], frames)
+
+            finishing = False
+            if st["fading_out"]:
+                n = min(len(fade_out) - st["out_pos"], frames)
                 if n > 0:
-                    buf[:n] *= fade_in[st["pos"]:st["pos"] + n]
-                    st["pos"] += n
-                if st["pos"] >= len(fade_in):
-                    st["fading"] = True
-            elif self._stop_event.is_set():
-                # Fade out only when actually shutting down, so the stop is
-                # click-free but normal operation is never attenuated.
-                n = min(len(fade_out), frames)
-                if n > 0:
-                    buf[:n] *= fade_out[:n]
+                    buf[:n] *= fade_out[st["out_pos"]:st["out_pos"] + n]
+                    st["out_pos"] += n
                 if n < frames:
                     buf[n:] = 0.0
-                    raise sd.CallbackStop
+                    finishing = True
+            elif not st["faded_in"]:
+                n = min(len(fade_in) - st["in_pos"], frames)
+                if n > 0:
+                    buf[:n] *= fade_in[st["in_pos"]:st["in_pos"] + n]
+                    st["in_pos"] += n
+                if st["in_pos"] >= len(fade_in):
+                    st["faded_in"] = True
 
             if channels == 2:
                 outdata[:] = np.repeat(buf[:, np.newaxis], 2, axis=1)
@@ -449,7 +567,18 @@ class KeepaliveEngine:
 
             st["rms"] = float(np.sqrt(np.mean(np.square(buf, dtype=np.float64))))
             st["frames"] += frames
-            if self._stop_event.is_set():
+
+            # A stop request starts the ramp; the stream is only torn down once
+            # the ramp has actually been delivered. Raising CallbackStop on the
+            # first stopping block (as this used to) cut the 1.5 s fade to one
+            # 93 ms block, or skipped it entirely when the stop landed during
+            # the fade-in.
+            if stop_event.is_set() and not st["fading_out"]:
+                st["fading_out"] = True
+                # Continue from the gain the fade-in had reached, so the two
+                # envelopes meet without a step: fade_out[k] == fade_in[last-k].
+                st["out_pos"] = max(0, len(fade_in) - 1 - st["in_pos"])
+            if finishing:
                 raise sd.CallbackStop
 
         try:
@@ -474,10 +603,9 @@ class KeepaliveEngine:
                                 signal_type=settings.get("signal_type"),
                                 level_dbfs=settings.get("level_dbfs"),
                                 audio_rms=0.0,
-                                expected_rms=amplitude / 2.0,
                                 frames_delivered=0)
-                while not self._stop_event.is_set():
-                    if self._stop_event.wait(HEARTBEAT_POLL_S):
+                while not stop_event.is_set():
+                    if stop_event.wait(HEARTBEAT_POLL_S):
                         break
                     self._set_stats(frames_delivered=st["frames"],
                                     audio_rms=st["rms"],
