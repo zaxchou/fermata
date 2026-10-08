@@ -101,12 +101,18 @@ def spectral_slope(x, sample_rate, f_lo=80.0, f_hi=12000.0):
     return float(np.polyfit(np.log2(freqs[band] / f_lo), db, 1)[0])
 
 
+def read(gen, total, block=4096):
+    """Pull `total` samples out of a generator, as a plain array."""
+    return np.concatenate([gen.block(block) for _ in range(total // block)]).astype(np.float64)
+
+
 SR = 44100
-gen = NoiseGenerator("pink", SR)
-N = 1 << 19
-blocks = [gen.generate(4096, 1.0) for _ in range(N // 4096)]
-sig = np.concatenate(blocks).astype(np.float64)
-sig = sig[N // 4:]                     # drop the start-up ramp
+pink = NoiseGenerator("pink", SR, amplitude=1.0)
+period = pink.period
+check("pink builds a loop", bool(period), f"{period} samples = {period/SR:.2f}s")
+
+N = 1 << 18                       # stays inside one period
+sig = read(pink, N)
 rms = float(np.sqrt(np.mean(sig ** 2)))
 slope = spectral_slope(sig, SR)
 check("pink output is -3 dB/octave",
@@ -114,17 +120,38 @@ check("pink output is -3 dB/octave",
 check("pink RMS matches uniform white",
       abs(rms - NOISE_RMS) / NOISE_RMS < 0.10, f"{rms:.4f} vs {NOISE_RMS:.4f}")
 check("pink is broadband, not silent", np.count_nonzero(sig) > len(sig) * 0.99)
-check("pink does not repeat block for block",
-      not np.array_equal(blocks[1], blocks[2]))
 
-white = NoiseGenerator("white", SR).generate(1 << 16, 1.0).astype(np.float64)
+# The loop must be periodic, and the wrap must be indistinguishable from any
+# other sample transition. Both fall out of building it circularly; asserting
+# them is what stops a future edit from quietly turning it into a cut-and-paste
+# loop with a click at the seam.
+two = read(NoiseGenerator("pink", SR, amplitude=1.0), period * 2)
+check("the loop repeats exactly after one period",
+      np.array_equal(two[:period], two[period:]),
+      f"period {period}")
+loop = two[:period]
+steps = np.abs(np.diff(loop))
+seam = abs(float(loop[0] - loop[-1]))
+check("the wrap step is no worse than the largest natural step",
+      seam <= float(steps.max()),
+      f"seam {seam:.2e} vs max natural step {steps.max():.2e}")
+
+white = read(NoiseGenerator("white", SR, amplitude=1.0), 1 << 16)
 check("white RMS is 1/sqrt(3) at unit amplitude",
       abs(float(np.sqrt(np.mean(white ** 2))) / NOISE_RMS - 1) < 0.05,
       f"{np.sqrt(np.mean(white ** 2)):.4f}")
-sine = NoiseGenerator("sine", SR, 1000.0).generate(1 << 16, 1.0).astype(np.float64)
+sine = read(NoiseGenerator("sine", SR, 1000.0, amplitude=1.0), 1 << 16)
 check("sine RMS is 1/sqrt(2) at unit amplitude",
       abs(float(np.sqrt(np.mean(sine ** 2))) * np.sqrt(2) - 1) < 0.02,
       f"{np.sqrt(np.mean(sine ** 2)):.4f}")
+check("sine has no loop (phase stays continuous)", NoiseGenerator("sine", SR).period is None)
+
+# The level is baked into the loop, so the callback does no arithmetic. Check the
+# scaling actually lands.
+loud = read(NoiseGenerator("pink", SR, amplitude=1e-2), 1 << 16)
+check("the loop carries the requested level",
+      abs(float(np.sqrt(np.mean(loud ** 2))) / (NOISE_RMS * 1e-2) - 1) < 0.05,
+      f"rms {np.sqrt(np.mean(loud ** 2)):.2e}")
 
 print()
 print("=== engine lifecycle ===")

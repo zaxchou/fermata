@@ -42,33 +42,68 @@ above the amplifier's own noise floor.
 
 ### How the noise is made
 
-Pink noise, by overlap-adding random-phase spectral frames: each frame draws a
-random spectrum, shapes it by `1/sqrt(f)`, inverse transforms it, and blends it
-in at a 50 % hop. The result is a genuine random process, not a loop, and the
-tilt is exact -- a test asserts it lands at -3 dB/octave.
+Pink noise, as a **ten-second loop**: random-phase spectral frames, each shaped by
+`1/sqrt(f)`, inverse transformed, and overlap-added *circularly* — so the loop is
+periodic by construction and has no seam to hear. At runtime the callback only
+slices it; the level is baked in, so there is no arithmetic at all.
 
-The first implementation ran a per-sample one-pole filter bank (Paul Kellet's) in
-a Python loop: 44 100 interpreter iterations a second, measured at **9.4 % of a
-core** for a utility whose entire job is to be invisible. The overlap-add version
-measures **0.94 %** and lands at -3.00 dB/oct against the old filter's -2.99.
+That last part is the whole point. The signal path used to generate a fresh frame
+per callback, which measured **0.45% of a core** on a live stream (in-callback
+timing, Stanmore II over WASAPI: ~95% of the callback's cost was generation and
+almost none of it was the writing or the level maths). Slicing a precomputed loop
+measures **0.02%**. Tests measure the tilt (-3 dB/octave), the level, that the
+loop repeats exactly one period later, and that the wrap step is *smaller than
+the largest sample-to-sample step already present in the signal* — which is what
+"no seam" means in practice rather than as an assertion.
+
+The level is exact rather than approximate for two small reasons: the sine window
+is used, not Hann, because at a 50% hop the sum of its squares is identically 1
+while Hann's wobbles between 0.5 and 1; and the spectral mask is scaled by
+Parseval so a unit-normal random spectrum really does come out at unit variance.
+
+An earlier version of this used Paul Kellet's one-pole filter bank, evaluated one
+sample at a time in Python — 44 100 interpreter iterations a second, **9.4% of a
+core** for a utility whose entire job is to be invisible. That is where this
+started.
 
 ## Cost
 
-Measured on the author's machine (i7-11700K, 16 threads, Windows 11), as process
-CPU time over a 30-second window:
+Two things turned out to be true, and neither was obvious beforehand.
+
+**The audio is not the expensive part, and no longer close to it.** Measured on
+the author's machine (i7-11700K, 16 threads, Windows 11) as process CPU time over
+45-60 second windows:
 
 | What | Measured |
 |---|---|
-| CPU, audio engine only (no GUI) | **0.94 %** of one core |
-| CPU, whole app, tray only | **1.9 %** of one core = 0.12 % of this 16-thread CPU |
-| CPU, whole app, window open | **3.0 %** of one core |
-| Memory, app process | ~130 MB working set |
-| Memory, including its WebView2 hosts | ~480-530 MB working set |
-| Stream | 44.1 kHz stereo, an ordinary shared-mode WASAPI stream |
+| CPU, audio engine alone (no GUI) | **0.08-0.10%** of one core |
+| CPU, whole app, tray only | **0.9%** of one core (app 0.24% + WebView2 0.66%) |
+| CPU, whole app, window open | **~3%** of one core (app 0.4% + WebView2 2.8%) |
 
-The honest reading of that table: **the settings GUI costs more than the audio
-does.** If you want no interface at all, a command-line C++ tool is a tenth of
-this -- see the comparison further down.
+Read the second and third rows together: having the settings window on screen
+costs around **2% of a core more** than leaving it in the tray, and the largest
+single line items in the whole program live there -- WebView2's browser process
+(~1.0%), renderer (~0.9%) and GPU process (~0.9%), the last of which is drawing a
+static page. Hide the window and the renderer and GPU both drop to 0.00%. The
+audio engine, for comparison, is 0.1%.
+
+That is the price of a WebView2 settings window, and it is worth knowing before
+deciding what you want: this is a tray icon that occasionally opens a form.
+
+| What | Measured |
+|---|---|
+| Memory, tray state | ~500 MB working set — **~130 MB** for the app, **~370 MB** for its seven WebView2 host processes |
+| Memory, app process commits | ~570 MB (the .NET runtime reserves address space; only ~130 MB of it is resident) |
+
+Working set is not a fixed property. Windows trims an idle process hard under
+memory pressure, and this one was observed at **140 MB total** on the same
+machine an hour later, with no code change. Task Manager will show you whatever
+the current situation is; ~500 MB is what it settles at when nothing is asking
+for memory.
+
+The honest summary of this table: **the settings window, not the signal, is what
+this costs.** If that trade is wrong for you, a command-line C++ tool is a tenth
+of it — see the comparison further down.
 
 ---
 
@@ -209,9 +244,10 @@ Fermata first (the single-instance guard would otherwise refuse the instance
 under test), and the EXE suite puts your Run key back the way it found it.
 
 ```
-python tests\test_core.py    # 31 checks: settings, autostart, devices, signal
-                             # spectrum and level, engine lifecycle
-python tests\test_gui.py     #  9 checks: window, tray, docs, single-instance
+python tests\test_core.py    # 35 checks: settings, autostart, devices, signal
+                             # spectrum, loop periodicity and level, engine
+                             # lifecycle
+python tests\test_gui.py     #  9 checks: window, tray, log, single-instance
 python tests\test_exe.py     # 15 checks: packaged EXE acceptance
 ```
 

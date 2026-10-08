@@ -754,7 +754,24 @@ $('language').onchange = async () => {
 };
 
 window.addEventListener('pywebviewready', () => refresh(true));
-setInterval(() => { if (state) refresh(false); }, 1000);
+
+/* Live readout.
+ *
+ * The readout is only worth refreshing while somebody can see it. Each tick is
+ * a JS -> Python round trip, and that round trip -- not the Python work it
+ * triggers -- is what keeps the WebView2 host and the .NET bridge busy several
+ * times a second. When the window is closed to the tray, which is how this app
+ * normally sits, that is pure background cost for a panel nobody is looking at.
+ *
+ * The timer itself is deliberately left running: the guard is inside it, so if
+ * the hidden flag were ever wrong, the cost is one second of staleness rather
+ * than a panel that stops updating. Focus and click refresh immediately too, so
+ * anything missed self-heals the moment the window is touched. */
+const tick = () => { if (state && !document.hidden) refresh(false); };
+setInterval(tick, 1000);
+window.addEventListener('focus', tick);
+document.addEventListener('click', tick);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 </script>
 </body>
 </html>

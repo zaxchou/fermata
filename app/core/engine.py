@@ -27,7 +27,13 @@ import numpy as np
 import sounddevice as sd
 
 FADE_S = 1.5
-BLOCK_FRAMES = 4096
+# Blocks of 16384 frames -- 341 ms at 48 kHz. PortAudio's per-period overhead is
+# paid once per block, and it is not small: measured over 60 s windows, an empty
+# callback costs 0.39% of a core at 4096 frames against 0.05% at 16384. Latency
+# is the only thing a bigger block costs, and a signal nobody is listening to
+# does not care about latency. Measured on the real engine: 4096 -> 0.21/0.31%,
+# 16384 -> 0.08/0.10% of a core.
+BLOCK_FRAMES = 16384
 HEARTBEAT_POLL_S = 0.5
 
 # Output RMS of the noise signals at unit amplitude. Uniform white noise drawn
@@ -82,108 +88,148 @@ def _com_uninitialize() -> None:
 # signal generation
 # --------------------------------------------------------------------------
 
-class _PinkNoise:
-    """Pink noise by overlap-add of random-phase spectral frames.
+# The signal is built once per stream, as a seamlessly looping buffer, and then
+# only sliced -- no arithmetic -- per callback.
+#
+# Why: generating noise inside the callback measured **0.45% of a core** on a
+# live stream (in-callback timing on a Stanmore II over WASAPI) while slicing a
+# precomputed loop measures **0.02%**. Generating was ~95% of the callback's
+# cost, so this is where the win is; the write and the level maths were never
+# the problem.
+#
+# The loop is periodic *by construction* rather than a cut-and-paste of a longer
+# run, so it has no seam to hear. It is made by overlap-adding spectral frames
+# **circularly**, which is the same -3 dB/octave shaping as before: identical
+# spectrum, identical level, and it wraps without a step.
+LOOP_SECONDS = 10.0
 
-    Each frame draws a random complex spectrum, shapes it by 1/sqrt(f), inverse
-    transforms it, windows it and overlap-adds it at a 50 % hop. The result is a
-    genuine stationary random process -- not a loop -- with a -3 dB/octave tilt.
+# Frame size used to *build* the loop -- a spectral-resolution choice, unrelated
+# to BLOCK_FRAMES. One frame is added per 2048 samples, overlap-added
+# circularly, which is what makes the loop periodic by construction.
+_LOOP_FRAME = 4096
 
-    This replaced Paul Kellet's one-pole bank, which is a fine filter but was
-    evaluated one sample at a time in Python: 44 100 interpreter iterations a
-    second, measured at **9.4 % of a core** for a tray utility whose entire job
-    is to be invisible. Generating a frame per 2048 samples costs 0.16 % and
-    measures within 0.02 dB/octave of the old spectrum.
+# Below this the 1/sqrt(f) tilt is flattened. Nothing about standby detection
+# happens down there, and a speaker cannot reproduce it anyway.
+F_FLOOR = 55.0
+# Roll off before Nyquist instead of letting the mask blow up at the edge.
+ROLLOFF = 0.44
+ROLL_W = 0.05
 
-    Two details make the level exact rather than approximate:
 
-      * the sine window is used, not Hann, because at a 50 % hop the sum of
-        squared windows is identically 1 (for Hann it wobbles between 0.5 and 1,
-        which shows up as ripple and a 1.25 dB level error);
-      * the spectral mask is scaled by Parseval so that the unit-normal spectrum
-        really does come out at unit variance -- verified in tests, not assumed.
+def _pink_mask(n: int, sample_rate: int) -> np.ndarray:
+    """1/sqrt(f) shaping for an n-point frame, scaled by Parseval.
+
+    The scaling is what makes the level exact rather than approximate: with it,
+    a unit-normal random spectrum really does come out at unit variance.
     """
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    mask = np.zeros_like(freqs)
+    band = freqs > 0
+    mask[band] = 1.0 / np.sqrt(np.maximum(freqs[band], F_FLOOR))
+    edge = ROLLOFF * sample_rate
+    top = freqs > edge
+    mask[top] *= np.exp(-((freqs[top] - edge) / (ROLL_W * sample_rate)) ** 2)
+    mask[0] = 0.0
+    # Parseval weights: 1 at DC and Nyquist, 2 elsewhere. real+imag are each
+    # standard normal, so E|Z|^2 = 2.
+    weights = np.full(freqs.shape, 2.0)
+    weights[0] = weights[-1] = 1.0
+    mask *= np.sqrt(n ** 2 / (2.0 * np.sum(weights * mask ** 2)))
+    return mask
 
-    FRAME = 4096
-    # Below this the 1/sqrt(f) tilt is flattened; a 4096-point frame cannot
-    # resolve much lower, and nothing about standby detection happens at 20 Hz.
-    F_FLOOR = 55.0
-    # Roll off before Nyquist instead of letting the mask blow up at the edge.
-    ROLLOFF = 0.44
-    ROLL_W = 0.05
 
-    def __init__(self, sample_rate: int):
-        n = self.FRAME
-        self._hop = n // 2
+def _build_loop(kind: str, sample_rate: int, amplitude: float) -> np.ndarray:
+    """One period of a band-limited noise signal, pre-scaled and ready to play.
 
-        freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
-        mask = np.zeros_like(freqs)
-        band = freqs > 0
-        mask[band] = 1.0 / np.sqrt(np.maximum(freqs[band], self.F_FLOOR))
-        edge = self.ROLLOFF * sample_rate
-        top = freqs > edge
-        mask[top] *= np.exp(-((freqs[top] - edge) / (self.ROLL_W * sample_rate)) ** 2)
-        mask[0] = 0.0
+    Length is rounded to a whole number of hops so that every sample position is
+    covered by exactly two frames; that keeps the sum of squared windows equal
+    to 1 everywhere, including across the wrap.
+    """
+    n = _LOOP_FRAME
+    hop = n // 2
+    hops = max(4, round(LOOP_SECONDS * sample_rate / hop))
+    length = hops * hop
 
-        # Parseval weights: 1 at DC and Nyquist, 2 elsewhere. real+imag are each
-        # standard normal, so E|Z|^2 = 2.
-        weights = np.full(freqs.shape, 2.0)
-        weights[0] = weights[-1] = 1.0
-        mask *= np.sqrt(n ** 2 / (2.0 * np.sum(weights * mask ** 2)))
-        self._mask = mask
+    if kind == "white":
+        # Adjacent samples are uncorrelated, so a periodic buffer needs no
+        # special treatment to be seamless.
+        acc = np.random.uniform(-1.0, 1.0, length)
+    else:
+        acc = np.zeros(length, dtype=np.float64)
+        mask = _pink_mask(n, sample_rate)
+        # sqrt of the periodic Hann: sum of squares is identically 1 at a 50%
+        # hop. Hann itself wobbles between 0.5 and 1, which shows up as ripple
+        # and a 1.25 dB level error.
+        win = np.sin(np.pi * np.arange(n) / n)
+        for k in range(hops):
+            spec = (np.random.standard_normal(n // 2 + 1)
+                    + 1j * np.random.standard_normal(n // 2 + 1)) * mask
+            frame = np.fft.irfft(spec, n) * win
+            start = (k * hop) % length
+            end = start + n
+            if end <= length:
+                acc[start:end] += frame
+            else:                      # the last frames wrap around the circle
+                cut = length - start
+                acc[start:] += frame[:cut]
+                acc[:end - length] += frame[cut:]
 
-        # sqrt of the periodic Hann window: sum(w^2) == 1 at a 50 % hop.
-        self._win = np.sin(np.pi * np.arange(n) / n)
-
-        self._tail = np.zeros(n, dtype=np.float64)
-        self._buf = np.zeros(0, dtype=np.float64)
-        self._pos = 0
-
-    def _advance(self) -> None:
-        """Add one new windowed frame to the overlap queue."""
-        n = self.FRAME
-        spec = (np.random.standard_normal(n // 2 + 1)
-                + 1j * np.random.standard_normal(n // 2 + 1)) * self._mask
-        frame = np.fft.irfft(spec, n) * self._win
-        self._buf = self._tail[:self._hop] + frame[:self._hop]
-        self._tail[:self._hop] = self._tail[self._hop:] + frame[self._hop:]
-        self._pos = 0
-
-    def generate(self, frames: int, amplitude: float) -> np.ndarray:
-        """`frames` samples of unit-variance pink noise, scaled to amplitude."""
-        out = np.empty(frames, dtype=np.float32)
-        gain = amplitude * NOISE_RMS
-        got = 0
-        while got < frames:
-            if self._pos >= len(self._buf):
-                self._advance()
-            take = min(len(self._buf) - self._pos, frames - got)
-            out[got:got + take] = self._buf[self._pos:self._pos + take] * gain
-            self._pos += take
-            got += take
-        return out
+    # Normalise to unit RMS, then scale to the requested level, so that the
+    # callback never has to multiply: the buffer is already the signal.
+    acc = acc / np.sqrt(np.mean(acc ** 2))
+    return (acc * amplitude * NOISE_RMS).astype(np.float32)
 
 
 class NoiseGenerator:
-    """Streaming signal generator; one value is produced per frame."""
+    """Slices a precomputed signal. `block()` returns a view, not a copy."""
 
-    def __init__(self, kind: str, sample_rate: int, freq: float = 19000.0):
+    def __init__(self, kind: str, sample_rate: int, freq: float = 19000.0,
+                 amplitude: float = 1.0):
         self.kind = kind
         self.sample_rate = sample_rate
         self.freq = freq
-        self.phase = 0.0
-        self._pink = _PinkNoise(sample_rate) if kind == "pink" else None
+        self._amp = amplitude
+        self._pos = 0
+        self._phase = 0.0
+        self._buf = (_build_loop(kind, sample_rate, amplitude)
+                     if kind in ("pink", "white") else None)
 
-    def generate(self, frames: int, amplitude: float) -> np.ndarray:
-        if self.kind == "pink":
-            return self._pink.generate(frames, amplitude)
-        if self.kind == "white":
-            return (np.random.uniform(-1.0, 1.0, frames).astype(np.float32)
-                    * amplitude)
-        step = 2.0 * np.pi * self.freq / self.sample_rate
-        idx = self.phase + step * np.arange(frames, dtype=np.float64)
-        self.phase = float(idx[-1] % (2.0 * np.pi))
-        return (np.sin(idx) * amplitude).astype(np.float32)
+    @property
+    def period(self) -> int | None:
+        """Length of the loop in samples, or None for a signal with no loop.
+
+        Public because it is the kind of thing a test needs to assert the wrap
+        is exactly where it claims to be.
+        """
+        return len(self._buf) if self._buf is not None else None
+
+    def block(self, frames: int) -> np.ndarray:
+        """`frames` samples of the pre-scaled signal.
+
+        For pink and white this is a view into the loop: no allocation and no
+        arithmetic. A sine keeps a running phase instead, because a periodic
+        buffer would only be exact when the frequency divides the sample rate
+        evenly, and a phase jump in a sine is a click rather than a curiosity.
+        """
+        buf = self._buf
+        if buf is None:
+            step = 2.0 * np.pi * self.freq / self.sample_rate
+            idx = self._phase + step * np.arange(frames, dtype=np.float64)
+            self._phase = float(idx[-1] % (2.0 * np.pi))
+            return (np.sin(idx) * self._amp).astype(np.float32)
+
+        if frames >= len(buf):                  # defensive: absurd blocksize
+            reps = -(-frames // len(buf))
+            return np.tile(buf, reps)[:frames]
+
+        i = self._pos
+        end = i + frames
+        if end <= len(buf):
+            out = buf[i:end]
+        else:
+            out = np.concatenate((buf[i:], buf[:end - len(buf)]))
+        self._pos = end % len(buf)
+        return out
 
 
 def dbfs_to_amplitude(dbfs: float) -> float:
@@ -529,44 +575,53 @@ class KeepaliveEngine:
         channels = min(int(info.get("max_output_channels", 2)), 2) or 1
         amplitude = dbfs_to_amplitude(float(settings.get("level_dbfs", -60.0)))
         gen = NoiseGenerator(str(settings.get("signal_type", "pink")),
-                             sample_rate, float(settings.get("freq_hz", 19000.0)))
+                             sample_rate, float(settings.get("freq_hz", 19000.0)),
+                             amplitude)
 
         fade_in = np.linspace(0.0, 1.0, int(sample_rate * FADE_S),
                               dtype=np.float32)
+        fade_in = fade_in[:, np.newaxis]           # broadcast across channels
         fade_out = fade_in[::-1].copy()
         st: dict[str, Any] = {"in_pos": 0, "faded_in": False,
-                              "fading_out": False, "out_pos": 0,
+                              "fading_out": False, "out_pos": 0, "n": 0,
                               "frames": 0, "rms": 0.0, "errors": 0}
+        # The level readout is for a human looking at the window, and the window
+        # asks twice a second. Measuring it on every block was work nobody could
+        # see -- and at this block size it would be a real share of the total.
+        rms_every = 2
 
         def callback(outdata, frames, time_info, status):  # noqa: ARG001
             if status:
                 st["errors"] += 1
-            buf = gen.generate(frames, amplitude)
+
+            # Straight into the driver's buffer: the generator returns a view of
+            # the pre-scaled loop, so this is pure memory copy.
+            block = gen.block(frames)
+            outdata[:, 0] = block
+            if channels == 2:
+                outdata[:, 1] = block
 
             finishing = False
             if st["fading_out"]:
                 n = min(len(fade_out) - st["out_pos"], frames)
                 if n > 0:
-                    buf[:n] *= fade_out[st["out_pos"]:st["out_pos"] + n]
+                    outdata[:n] *= fade_out[st["out_pos"]:st["out_pos"] + n]
                     st["out_pos"] += n
                 if n < frames:
-                    buf[n:] = 0.0
+                    outdata[n:] = 0.0
                     finishing = True
             elif not st["faded_in"]:
                 n = min(len(fade_in) - st["in_pos"], frames)
                 if n > 0:
-                    buf[:n] *= fade_in[st["in_pos"]:st["in_pos"] + n]
+                    outdata[:n] *= fade_in[st["in_pos"]:st["in_pos"] + n]
                     st["in_pos"] += n
                 if st["in_pos"] >= len(fade_in):
                     st["faded_in"] = True
 
-            if channels == 2:
-                outdata[:] = np.repeat(buf[:, np.newaxis], 2, axis=1)
-            else:
-                outdata[:] = buf.reshape(-1, 1)
-
-            st["rms"] = float(np.sqrt(np.mean(np.square(buf, dtype=np.float64))))
             st["frames"] += frames
+            st["n"] += 1
+            if st["n"] % rms_every == 0:
+                st["rms"] = float(np.sqrt(np.dot(block, block) / frames))
 
             # A stop request starts the ramp; the stream is only torn down once
             # the ramp has actually been delivered. Raising CallbackStop on the
