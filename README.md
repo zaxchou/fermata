@@ -74,7 +74,10 @@ this -- see the comparison further down.
 
 ## Quick start
 
-Run `Fermata.exe`.
+Download **[the latest release](https://github.com/zaxchou/fermata/releases/latest)**
+and extract the zip, or [build it yourself](#building-from-source).
+
+Then run `Fermata.exe`.
 
 First launch opens the settings window and starts feeding the device right away.
 After that:
@@ -94,7 +97,7 @@ sibling; copying the EXE alone will not work.
 
 | Setting | What it does |
 |---|---|
-| **Output device** | Which device to keep awake, chosen by name from the list. *Any device (system default)* follows whatever Windows is currently routing to, which is the right choice for most people. |
+| **Output device** | Which device to keep awake, chosen by name from the list. *Any device (system default)* resolves to whatever the default output is at that moment -- see the note below. |
 | **Name filter** | Used instead, when the device is not in the list -- for example before a Bluetooth speaker has been paired. Case-insensitive substring match; plain text, not a pattern. |
 | **Signal type** | Pink (default), white, or sine. Pink is the safe choice -- see above. |
 | **Frequency** | Only used by the sine signal. |
@@ -112,6 +115,16 @@ On the level setting: it sets the peak amplitude of the generated waveform, so
 pink and white come out at the same RMS (they are both normalised to uniform
 white noise) and a sine is 1.8 dB louder in RMS terms at the same setting. The
 status tab shows the measured RMS, so you can see what is actually going out.
+
+On the device setting: *Any device (system default)* is resolved **when the
+stream starts**, and again on each reconnect -- not continuously. Switching the
+Windows default output afterwards does not move the stream. That is deliberate:
+if it chased the default, plugging in headphones would abandon the speaker this
+tool exists to protect. The consequence worth knowing is that the device a
+running instance feeds is decided at startup, so **if you want one specific
+device protected, select it by name rather than leaving it on "Any device"**.
+Device indices shift between launches (a Bluetooth endpoint that was `#10` can be
+`#14` an hour later), which is why the selection is stored as a name.
 
 ### Files
 
