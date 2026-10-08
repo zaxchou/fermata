@@ -7,12 +7,23 @@ start/status/stop cycle against the actual speaker.
 import json
 import os
 import sys
+import tempfile
 import time
+
+# Redirect the app's data directory BEFORE importing anything that reads it.
+# One of the checks below writes a deliberately corrupt settings file, and doing
+# that to the real profile would destroy the user's configuration -- which is
+# exactly what happened before this was isolated.
+_TMP = tempfile.mkdtemp(prefix="fermata_test_")
+os.environ["FERMATA_DATA_DIR"] = _TMP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import autostart, settings as settings_mod
 from app.core.engine import KeepaliveEngine, list_output_devices, pick_device
+
+print(f"test data dir: {_TMP}")
+print()
 
 results = []
 

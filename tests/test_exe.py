@@ -14,14 +14,22 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from ctypes import wintypes
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "dist", "Fermata", "Fermata.exe")
+
+# Isolate the app's data directory. The EXE inherits this environment, so it
+# reads and writes the throwaway directory instead of the real profile, and the
+# test can seed the exact preconditions it needs.
+_TMP = tempfile.mkdtemp(prefix="fermata_exetest_")
+os.environ["FERMATA_DATA_DIR"] = _TMP
+
 sys.path.insert(0, ROOT)
 
-LOG = os.path.join(os.environ["APPDATA"], "Fermata", "logs", "app.log")
+LOG = os.path.join(_TMP, "logs", "app.log")
 TITLE = "Fermata"
 WM_CLOSE = 0x0010
 
@@ -88,6 +96,17 @@ if not os.path.exists(EXE):
 print("size: %.1f MB" % (os.path.getsize(EXE) / 1048576))
 
 kill_stale()
+
+# Establish the preconditions explicitly rather than inheriting whatever the
+# real profile happened to hold. Step 4 is only meaningful if autostart is
+# wanted and the Run entry starts out absent, so the app has to restore it.
+from app.core import autostart, settings as settings_mod  # noqa: E402
+_seed = settings_mod.load()
+_seed["launch_at_login"] = True
+settings_mod.save(_seed)
+autostart.disable()
+print(f"seeded settings in {settings_mod.config_path()}")
+print(f"run entry cleared; autostart wanted = {_seed['launch_at_login']}")
 
 # Read only NEW log lines instead of deleting the file. The app may still hold
 # the log open (and on this machine a delete of an open file fails), so

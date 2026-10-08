@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pystray  # noqa: E402
 import webview  # noqa: E402
 
-from app.core import autostart, icon, settings as settings_mod  # noqa: E402
+from app.core import autostart, i18n, icon, settings as settings_mod  # noqa: E402
 from app.core.engine import KeepaliveEngine, list_output_devices  # noqa: E402
 from app.core.paths import app_data_dir, log_path, ui_file  # noqa: E402
 
@@ -96,18 +96,23 @@ class Api:
         return {
             "settings": self._app.settings,
             "status": self._app.engine.status(),
-            "devices": list_output_devices(),
+            "devices": list_output_devices(unique=True),
             "autostart_enabled": autostart.is_enabled(),
             "autostart_command": autostart.current_value(),
             "config_path": settings_mod.config_path(),
             "version": self._app.version,
+            # The resolved language, not the raw preference: the window needs to
+            # know what "auto" actually landed on.
+            "language": self._app.language,
         }
 
     def status(self) -> dict:
         return self._app.engine.status()
 
     def list_devices(self) -> list:
-        return list_output_devices()
+        # Collapsed: one row per physical device, tagged with the host API the
+        # engine will actually pick. See list_output_devices(unique=True).
+        return list_output_devices(unique=True)
 
     def save_settings(self, incoming: dict) -> dict:
         return self._app.apply_settings(incoming or {})
@@ -152,6 +157,11 @@ class Application:
         self.tray: pystray.Icon | None = None
         self._quitting = threading.Event()
         self._last_icon_state = ""
+
+        # Resolve "auto" once, up front: the tray menu needs a language before
+        # the window has even loaded.
+        self.language = i18n.set_language(self.settings.get("language", "auto"))
+        log.info("language resolved to %s", self.language)
 
         self._sync_autostart()
 
@@ -222,6 +232,13 @@ class Application:
         # how a source run could delete an installed build's Run entry.
         self._sync_autostart()
 
+        # Follow a language change in the tray immediately.
+        new_language = i18n.set_language(self.settings.get("language", "auto"))
+        if new_language != self.language:
+            self.language = new_language
+            log.info("language changed to %s", new_language)
+        self._sync_tray(force=True)
+
         # Apply audio changes immediately rather than waiting for a restart.
         if was_running:
             self.engine.stop()
@@ -286,19 +303,22 @@ class Application:
     # -- tray -----------------------------------------------------------
 
     def _tray_menu(self) -> pystray.Menu:
-        running = lambda _i: self.engine.is_running()  # noqa: E731
+        # Every label is a callable so the menu follows a language change
+        # without rebuilding the icon.
         return pystray.Menu(
-            pystray.MenuItem("Show settings", lambda i, it: self.show_window(),
-                             default=True),
+            pystray.MenuItem(lambda _i: i18n.t("tray.show"),
+                             lambda i, it: self.show_window(), default=True),
             pystray.MenuItem(
-                lambda item: "Stop keeping awake" if self.engine.is_running()
-                else "Start keeping awake",
+                lambda _i: i18n.t("tray.stop") if self.engine.is_running()
+                else i18n.t("tray.start"),
                 self._tray_toggle),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Launch at login", self._tray_autostart,
+            pystray.MenuItem(lambda _i: i18n.t("tray.autostart"),
+                             self._tray_autostart,
                              checked=lambda item: autostart.is_enabled()),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", lambda i, it: self.request_quit()),
+            pystray.MenuItem(lambda _i: i18n.t("tray.quit"),
+                             lambda i, it: self.request_quit()),
         )
 
     def _tray_toggle(self, _icon, _item) -> None:
@@ -340,11 +360,8 @@ class Application:
         except Exception as exc:
             log.debug("tray icon update failed: %s", exc)
 
-        label = {
-            "running": "Active", "waiting": "Waiting for speaker",
-            "reconnecting": "Reconnecting", "error": "Error",
-            "stopped": "Stopped",
-        }.get(state, state)
+        label = i18n.t(f"state.{state}") if state in (
+            "running", "waiting", "reconnecting", "error", "stopped") else state
         dev = st.get("device_name") or ""
         self.tray.title = f"{APP_TITLE} - {label}" + (f"\n{dev}" if dev else "")
 
@@ -370,8 +387,8 @@ class Application:
             APP_TITLE,
             url=ui_file("index.html"),
             js_api=api,
-            width=900, height=800,
-            min_size=(740, 620),
+            width=880, height=620,
+            min_size=(720, 520),
             hidden=self.start_minimized,
         )
 

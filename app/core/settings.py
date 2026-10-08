@@ -40,6 +40,8 @@ DEFAULTS: dict[str, Any] = {
     "start_minimized": True,
     # closing the window hides it instead of quitting
     "close_to_tray": True,
+    # auto = follow the Windows UI language; or force "en" / "zh"
+    "language": "auto",
 }
 
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
@@ -51,6 +53,7 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 _SIGNAL_TYPES = ("pink", "white", "sine")
+_LANGUAGES = ("auto", "en", "zh")
 
 
 def _coerce(key: str, value: Any) -> Any:
@@ -69,6 +72,8 @@ def _coerce(key: str, value: Any) -> Any:
     if isinstance(default, str):
         text = str(value)
         if key == "signal_type" and text not in _SIGNAL_TYPES:
+            return default
+        if key == "language" and text not in _LANGUAGES:
             return default
         if key == "device_hint":
             text = text.strip() or default

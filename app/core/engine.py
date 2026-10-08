@@ -121,8 +121,16 @@ def dbfs_to_amplitude(dbfs: float) -> float:
 # device discovery
 # --------------------------------------------------------------------------
 
-def list_output_devices() -> list[dict[str, Any]]:
-    """Every output-capable device, with the host API and a default marker."""
+def list_output_devices(unique: bool = False) -> list[dict[str, Any]]:
+    """Every output-capable device, with the host API and a default marker.
+
+    unique=True collapses the per-host-API duplicates. One physical device shows
+    up once per host API (MME, DirectSound, WASAPI) with the same name, and
+    listing all of them in a picker is noise -- worse, it invites picking the
+    MME entry, which is not what the engine will use, because pick_device ranks
+    WASAPI first. Collapsing keeps the view honest: one row per device, naming
+    the host API that will actually be selected.
+    """
     devices: list[dict[str, Any]] = []
     try:
         default_idx = sd.default.device[1]
@@ -143,8 +151,33 @@ def list_output_devices() -> list[dict[str, Any]]:
                 "is_default": idx == default_idx,
             })
     except Exception:
-        pass
-    return devices
+        return []
+
+    if not unique:
+        return devices
+
+    # Best (lowest) rank wins for a given name; the rank order must match
+    # pick_device, or the picker would advertise a host API the engine does not use.
+    order = {"Windows WASAPI": 0, "Windows DirectSound": 1, "MME": 2}
+
+    def rank(d: dict[str, Any]) -> tuple[int, int]:
+        for name, tier in order.items():
+            if d["host_api"].startswith(name):
+                return tier, d["index"]
+        return 9, d["index"]
+
+    best: dict[str, dict[str, Any]] = {}
+    for d in devices:
+        cur = best.get(d["name"])
+        if cur is None:
+            best[d["name"]] = d
+            continue
+        if rank(d) < rank(cur):
+            d["is_default"] = d["is_default"] or cur["is_default"]
+            best[d["name"]] = d
+        else:
+            cur["is_default"] = cur["is_default"] or d["is_default"]
+    return sorted(best.values(), key=lambda d: d["index"])
 
 
 def _api_name(index: int) -> str:

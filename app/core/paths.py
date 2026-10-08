@@ -13,8 +13,19 @@ APP_NAME = "Fermata"
 
 
 def app_data_dir() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    path = os.path.join(base, APP_NAME)
+    """Directory for settings and logs.
+
+    Overridable with FERMATA_DATA_DIR. That serves two purposes: the tests can
+    run against a throwaway directory instead of the real one (one of them
+    deliberately writes a corrupt settings file, and doing that to a live
+    profile is not acceptable), and it gives a portable mode for free.
+    """
+    override = os.environ.get("FERMATA_DATA_DIR")
+    if override:
+        path = override
+    else:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, APP_NAME)
     os.makedirs(path, exist_ok=True)
     return path
 
