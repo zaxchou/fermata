@@ -1,0 +1,24 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- PyInstaller ---
+# Build output is not committed. Publish the folder build as a release asset
+# instead, so the repository stays text-only and diffable.
+build/
+dist/
+*.manifest
+
+# --- app runtime state (never commit; contains machine-specific data) ---
+*.status.json
+selftest.txt
+
+# --- editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
