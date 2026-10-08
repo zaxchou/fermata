@@ -22,7 +22,8 @@ os.environ["FERMATA_DATA_DIR"] = _TMP
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import autostart, settings as settings_mod
-from app.core.engine import (NOISE_RMS, KeepaliveEngine, NoiseGenerator,
+from app.core.engine import (NOISE_RMS, _API_ORDER, _is_hands_free,
+                             KeepaliveEngine, NoiseGenerator,
                              dbfs_to_amplitude, list_output_devices, pick_device)
 
 print(f"test data dir: {_TMP}")
@@ -86,6 +87,29 @@ check("unmatched filter returns None", pick_device("no-such-device-zzz") is None
 if paren:
     check("filter is case-insensitive",
           pick_device(paren.upper()) is not None, paren.upper())
+
+# Bluetooth hands-free endpoints are 8/16 kHz mono and opening one can force the
+# headset out of A2DP into HFP. Windows exposes them through the raw driver
+# layer with stripped or driver-qualified names, so they are excluded by name.
+HFP = ("耳机 (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0\r\n;"
+       ";(WH-1000XM4))")
+check("hands-free endpoint recognised (driver-qualified name)",
+      _is_hands_free(HFP))
+check("hands-free endpoint recognised (plain name)",
+      _is_hands_free("Headset (Hands-Free)"))
+check("a normal device name is not mistaken for one",
+      not _is_hands_free("扬声器 (STANMORE II)")
+      and not _is_hands_free("Speakers (Realtek Speaker)")
+      and not _is_hands_free("Headphones (High Fidelity Audio)"))
+listed = [d["name"] for d in uniq]
+check("no hands-free endpoint is offered in the picker",
+      not any(_is_hands_free(n) for n in listed),
+      f"{len(listed)} devices listed")
+check("no hands-free endpoint is reachable by name filter",
+      pick_device("WH-1000XM4") is None)
+check("WDM-KS ranks below the shared-mode APIs",
+      _API_ORDER.index("Windows WDM-KS") > _API_ORDER.index("MME"),
+      " -> ".join(_API_ORDER))
 
 print()
 print("=== signal ===")

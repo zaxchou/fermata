@@ -240,6 +240,28 @@ def dbfs_to_amplitude(dbfs: float) -> float:
 # device discovery
 # --------------------------------------------------------------------------
 
+def _is_hands_free(name: str) -> bool:
+    """True for a Bluetooth hands-free (HFP) endpoint.
+
+    Windows exposes these through the raw WDM-KS driver layer at 8 or 16 kHz,
+    mono, with names like `Headset (@System32\\drivers\\bthhfenum.sys,#2;
+    %1 Hands-Free%0 ...)`. Feeding one is actively harmful rather than merely
+    pointless: opening a hands-free endpoint can force the headset out of A2DP
+    into HFP, so music sounds like a phone call until the device is reconnected.
+    They are excluded by name, from both the picker and the matcher.
+    """
+    low = name.casefold()
+    return ("hands-free" in low or "handsfree" in low
+            or "bthhfenum" in low)
+
+
+# Preference order for the host API behind an endpoint. Ranked, not filtered, so
+# that a device exposed only by one of them still works; WDM-KS is last because
+# it is the raw driver layer and its entries duplicate the shared-mode ones under
+# stripped names ("扬声器 ()").
+_API_ORDER = ("Windows WASAPI", "Windows DirectSound", "MME", "Windows WDM-KS")
+
+
 def list_output_devices(unique: bool = False) -> list[dict[str, Any]]:
     """Every output-capable device, with the host API and a default marker.
 
@@ -260,6 +282,8 @@ def list_output_devices(unique: bool = False) -> list[dict[str, Any]]:
         for idx, dev in enumerate(sd.query_devices()):
             if dev.get("max_output_channels", 0) < 1:
                 continue
+            if _is_hands_free(dev["name"]):
+                continue
             api = hostapis[dev["hostapi"]]["name"]
             devices.append({
                 "index": idx,
@@ -277,13 +301,11 @@ def list_output_devices(unique: bool = False) -> list[dict[str, Any]]:
 
     # Best (lowest) rank wins for a given name; the rank order must match
     # pick_device, or the picker would advertise a host API the engine does not use.
-    order = {"Windows WASAPI": 0, "Windows DirectSound": 1, "MME": 2}
-
     def rank(d: dict[str, Any]) -> tuple[int, int]:
-        for name, tier in order.items():
+        for tier, name in enumerate(_API_ORDER):
             if d["host_api"].startswith(name):
                 return tier, d["index"]
-        return 9, d["index"]
+        return len(_API_ORDER), d["index"]
 
     best: dict[str, dict[str, Any]] = {}
     for d in devices:
@@ -331,6 +353,8 @@ def pick_device(hint: str) -> tuple[int, dict] | None:
         for idx, dev in enumerate(sd.query_devices()):
             if dev.get("max_output_channels", 0) < 1:
                 continue
+            if _is_hands_free(dev["name"]):
+                continue
             if not hint or _matches(hint, dev["name"]):
                 matches.append((idx, dev))
     except Exception:
@@ -342,12 +366,11 @@ def pick_device(hint: str) -> tuple[int, dict] | None:
         try:
             api = _api_name(idx)
         except Exception:
-            return 9, idx
-        for tier, name in enumerate(("Windows WASAPI", "Windows DirectSound",
-                                     "MME")):
+            return len(_API_ORDER), idx
+        for tier, name in enumerate(_API_ORDER):
             if api.startswith(name):
                 return tier, idx
-        return 9, idx
+        return len(_API_ORDER), idx
 
     best = min(rank(i)[0] for i, _ in matches)
     pool = [(i, d) for i, d in matches if rank(i)[0] == best]
