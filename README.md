@@ -177,6 +177,10 @@ After that:
   waiting or reconnecting, red = error, grey = stopped. The dark rounded square
   around it is the same mark you see in the window header.
 - Tick **Launch at login** and it starts by itself, minimized to the tray.
+- **Save settings** stays grey while nothing has changed (the footer reads
+  *No unsaved changes*). It turns green as soon as an edit is pending, and goes
+  grey again after saving -- or if you put the value back by hand. A failed
+  save keeps your edits and the green button, so you can retry.
 
 It is a folder build, so move the whole folder. The EXE needs its `_internal`
 sibling; copying the EXE alone will not work.

@@ -60,13 +60,20 @@
        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .spacer{flex:1}
 
+  /* The pill and the Start/Stop button share one height and one type size.
+     They used to drift apart (6px vs 9px padding, 12px vs 13px type), which
+     read as two controls of different weight sitting on the same row. */
   .status-pill{
-    display:inline-flex;align-items:center;gap:7px;flex:none;
-    padding:6px 12px;border-radius:999px;
-    font-size:12px;font-weight:600;letter-spacing:.02em;
+    display:inline-flex;align-items:center;justify-content:center;gap:7px;flex:none;
+    height:34px;padding:0 13px;border-radius:999px;
+    font-size:12.5px;font-weight:600;letter-spacing:.02em;
     background:rgba(148,163,184,.16);color:var(--muted);
     border:1px solid transparent;
     transition:background .25s,color .25s,border-color .25s;
+  }
+  header > .btn{
+    height:34px;padding:0 16px;font-size:12.5px;
+    display:inline-flex;align-items:center;justify-content:center;
   }
   .status-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--idle)}
   .status-pill.running{background:var(--accent-soft);color:#12743a;border-color:rgba(21,163,74,.22)}
@@ -187,6 +194,12 @@
   .btn.danger:hover{background:var(--danger-soft)}
   .btn.sm{padding:7px 13px;font-size:12.5px}
   .btn:disabled{opacity:.5;cursor:default}
+  /* A clean form is an explicitly grey button, not a faded green one:
+     the colour is what says "nothing to save here". */
+  #btnSave:disabled{
+    background:rgba(148,163,184,.22);border-color:transparent;
+    color:var(--muted);opacity:1;
+  }
 
   /* ---------- footer ---------- */
   footer{
@@ -473,6 +486,7 @@ const I18N = {
     'lang.auto':'Auto (system)',
     'unit.hz':'Hz','unit.seconds':'s','unit.h':'h','unit.m':'m','unit.s':'s',
     'note.saved':'Saved','note.failed':'Could not save',
+    'note.noChanges':'No unsaved changes','tip.noChanges':'Nothing has changed since the last save',
     'note.autostartFailed':'Could not change autostart',
   },
   zh: {
@@ -518,6 +532,7 @@ const I18N = {
     'lang.auto':'跟随系统',
     'unit.hz':'Hz','unit.seconds':'秒','unit.h':'小时','unit.m':'分','unit.s':'秒',
     'note.saved':'已保存','note.failed':'保存失败',
+    'note.noChanges':'没有未保存的更改','tip.noChanges':'自上次保存后没有更改',
     'note.autostartFailed':'无法修改开机自启',
   }
 };
@@ -599,8 +614,11 @@ function paintLevel(){
   $('levelVal').textContent = v.toFixed(0) + ' dBFS';
 }
 
-function paintSeg(){
-  const cur = state.settings.signal_type;
+function paintSeg(cur){
+  // No argument = render from saved settings (used by fillForm). A click
+  // passes the button just picked; re-reading state.settings here used to
+  // snap the highlight straight back, making the three buttons do nothing.
+  if (!cur) cur = state.settings.signal_type;
   $('typeSeg').querySelectorAll('button').forEach(b =>
     b.classList.toggle('on', b.dataset.v === cur));
   $('rowFreq').classList.toggle('hidden', cur !== 'sine');
@@ -679,6 +697,7 @@ async function refresh(full){
     applyStatic();
     await loadDevices();
     fillForm();
+    markClean();          // form now mirrors the file: nothing to save
   } else {
     state.status = await window.pywebview.api.status();
   }
@@ -702,14 +721,61 @@ function collect(){
   });
 }
 
+/* ---- unsaved-changes state -------------------------------------------
+   Save is a state readout, not only an action: grey and disabled while the
+   form matches what is on disk, green only while there is something to save.
+   Comparing a serialised snapshot instead of counting edit events means that
+   undoing a change by hand turns it grey again, and a programmatic fillForm()
+   (which writes .value/.checked directly and fires no events) is never
+   mistaken for a user edit. */
+let savedSnapshot = null;
+let noteTimer = null;
+const formSnapshot = () => JSON.stringify(collect());
+const formDirty = () => !!state && savedSnapshot !== null
+                        && formSnapshot() !== savedSnapshot;
+
+function renderSaveNote(){
+  clearTimeout(noteTimer);
+  const n = $('saveNote');
+  n.textContent = formDirty() ? '' : t('note.noChanges');
+  n.className = 'note';
+}
+
+function updateSaveButton(){
+  const dirty = formDirty();
+  $('btnSave').disabled = !dirty;
+  $('btnSave').title = dirty ? '' : t('tip.noChanges');
+}
+
+function markClean(){
+  savedSnapshot = formSnapshot();
+  updateSaveButton();
+  renderSaveNote();
+}
+
+function markDirty(){
+  updateSaveButton();
+  clearTimeout(noteTimer);
+  $('saveNote').textContent = '';
+  $('saveNote').className = 'note';
+}
+
 function flashNote(msg, ok){
+  clearTimeout(noteTimer);
   const n = $('saveNote');
   n.textContent = msg;
   n.className = 'note ' + (ok ? 'saved' : 'error');
-  setTimeout(() => { n.textContent = ''; n.className = 'note'; }, 2400);
+  noteTimer = setTimeout(renderSaveNote, 2400);
 }
 
 /* ---- events ---- */
+/* Any edit inside the scrolling form marks it dirty. Buttons in the header
+   and footer are outside <main>, so Start/Stop/Rescan cannot trigger this. */
+['input', 'change'].forEach(evt =>
+  document.addEventListener(evt, e => {
+    if (state && e.target.closest && e.target.closest('main')) markDirty();
+  }));
+
 $('tabs').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
   $('tabs').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
@@ -729,8 +795,13 @@ $('btnToggle').onclick = async () => {
 $('btnRefresh').onclick = () => refresh(true);
 
 $('btnSave').onclick = async () => {
+  if (!formDirty()) return;
+  $('btnSave').disabled = true;
   const res = await window.pywebview.api.save_settings(collect());
-  await refresh(true);
+  // A failed save must NOT reload the form: that would silently discard the
+  // edits the user can no longer see, while the button went grey anyway.
+  if (res.ok) await refresh(true);          // re-read from disk, then markClean()
+  else updateSaveButton();                  // keep edits, stay green, allow retry
   flashNote(res.ok ? t('note.saved') : t('note.failed') + ': ' + res.message, res.ok);
 };
 
@@ -738,8 +809,8 @@ $('btnFolder').onclick = () => window.pywebview.api.open_data_folder();
 
 $('typeSeg').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
-  $('typeSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
-  paintSeg();
+  paintSeg(b.dataset.v);
+  markDirty();          // segmented buttons fire click, not input/change
 };
 
 $('level').oninput = () => {
