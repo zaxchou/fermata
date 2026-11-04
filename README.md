@@ -21,9 +21,13 @@ speakers drop the link, USB DACs sleep and pop when they wake, soundbars switch
 inputs. Many of these timers cannot be disabled at all.
 
 The Marshall Stanmore II is one such case: it enters standby after **20 minutes
-without input**, and neither the top-panel knobs nor the vendor's app expose a
-setting for it. Fermata was written for that speaker, but nothing in it is
-specific to it.
+without input** -- an official specification, not a rule of thumb (see
+[Marshall support](https://www.marshall.com/hk/en/support/speakers/support-for-stanmore-ii-bluetooth/how-to-put-in-standby-mode)
+and the [STANMORE II user manual](https://www.marshallheadphones.com/on/demandware.static/-/Library-Sites-SharedLibrary-Marshall/default/dwe0dadd06/images/cms-pages/user/Stanmore_II_Full_User_Manual_en_230706.pdf);
+in standby all indicators go dark and a top-panel control or the Marshall
+Bluetooth app is needed to wake it). Neither the knobs nor the app expose a
+setting to disable that timer. Fermata was written for that speaker, but nothing
+in it is specific to it.
 
 ## Why noise, and not an ultrasonic tone
 
@@ -267,10 +271,29 @@ enough here** and the pulse is not needed.
 1.0.5 therefore changes `keepalive_pulse` to default `false`. The pulse stays
 as an option for devices with a genuinely higher level gate.
 
-> **Boundary**: one speaker, one long window -- this does not generalise. No
-> software here can read the standby circuit; the local evidence is the
-> combination of Bluetooth PnP presence and a direct user observation. The
-> pulse has never been shown to help, so it should not ship enabled.
+**The released 1.0.5 build was then verified the same way (2026-11-04).** On
+the same speaker it held **47 m 26 s of continuous silence** (20:21:16 to
+21:08:42; 2819 one-second samples = 46 m 59 s by record count) -- **2.37x** the
+official 20-minute timer. Every second was FLOOR at a median peak of -49.7
+dBFS; Fermata absent 0 s, `A2DP SNK` missing 0 s, endpoint non-Active 0 s,
+monitoring gaps 0. The window ended because the user played audio to check:
+playback worked **with no button press and no app**, and the user confirmed the
+speaker had stayed awake. Since Marshall says a standby speaker must be woken
+by a top-panel control or the app, that direct playback is stronger evidence
+than Bluetooth PnP presence alone. It matches the old build's 47 m 55 s within
+56 seconds.
+
+So the attribution stays narrow: 1.0.5 improves performance and observability
+(halved callback rate, stall watchdog, status readouts), **not** keepalive
+strength. The plain -60 dBFS floor did the work in both runs; the pulse stayed
+off (0 pulse seconds) and neither the watchdog nor reconnect ever fired.
+
+> **Boundary**: one speaker, one long window per build -- this does not
+> generalise. No software here can read the standby circuit; the strongest
+> local evidence is audio playing straight after ~47 minutes of silence with
+> no wake-up action, backed by Bluetooth PnP presence and direct user
+> observation. The pulse has never been shown to help, so it should not ship
+> enabled.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -290,8 +313,9 @@ and **Standby pulse** (On/Off).
 1. Power the speaker on, select Bluetooth as its source, play no music or video,
    and leave the Windows volume at its normal level.
 2. **Leave the default** (`keepalive_pulse: false`), wait **22 minutes**, and
-   look at the indicator lights (all off in standby). This step already passed
-   for 47 m 55 s on the reference machine.
+   look at the indicator lights (all off in standby). On the reference machine
+   this passed twice: 47 m 55 s on the old build and 47 m 26 s on 1.0.5, both
+   past the official 20-minute timer.
 3. Only if step 2 really slept, set `keepalive_pulse: true`, restart Fermata,
    and wait another **22 minutes**.
 4. If only step 3 stays awake, the pulse works. If **both** sleep, the level is
