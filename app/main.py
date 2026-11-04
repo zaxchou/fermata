@@ -145,7 +145,7 @@ class Api:
 # --------------------------------------------------------------------------
 
 class Application:
-    version = "1.0.4"
+    version = "1.0.5"
 
     def __init__(self, start_minimized: bool = False):
         self.settings = settings_mod.load()

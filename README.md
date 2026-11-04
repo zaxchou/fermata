@@ -242,31 +242,39 @@ accepted it.
 
 ---
 
-## Standby pulse (since 1.0.4)
+## Standby pulse (added in 1.0.4, off by default since 1.0.5)
 
-Feeding only an inaudible floor rests on an assumption that was never tested:
-that a device judges idleness by the *presence of a stream*. Many judge it by the
-*level of the decoded audio* instead. If that threshold sits above the floor,
-the UI stays green and the frame count keeps climbing while the speaker still
-goes to sleep after 20 minutes -- the worst form of a feature that only looks
-like it works.
+Feeding only an inaudible floor rested on an untested assumption: does a device
+judge idleness by the *presence of a stream*, or by the *level of the decoded
+audio*? If that threshold sits above the floor, the UI stays green and the frame
+count keeps climbing while the speaker still goes to sleep after 20 minutes --
+the worst form of a feature that only looks like it works. 1.0.4 therefore added
+a switchable periodic pulse: on top of the unchanged floor, a 0.35 s, -32 dBFS,
+90 Hz tone every 120 seconds (90 Hz sits roughly 25 dB down on the
+equal-loudness curve relative to 1 kHz; a 30 ms cosine ramp prevents a click).
+Loopback capture confirmed the peak rises from **-49 dBFS to -29 dBFS**
+(+20 dB) during a pulse, with accurate periodicity.
 
-1.0.4 therefore adds a **switchable** periodic pulse: on top of the unchanged
-floor, a 0.35 s, -32 dBFS, 90 Hz tone every 120 seconds. 90 Hz sits roughly
-25 dB down on the equal-loudness curve relative to 1 kHz, so the same digital
-level is far less audible; a 30 ms cosine ramp prevents a click.
+**A 2026-11-04 measurement falsified that hypothesis on this machine.** The
+build under test was the 8 October one: plain -60 dBFS pink noise, **no pulse
+and no watchdog**. A Marshall Stanmore II over Bluetooth A2DP stayed up through
+**47 m 55 s** of silence: endpoint Active for 2875/2875 s, `A2DP SNK` present
+throughout, Fermata absent for 0 s, zero monitoring gaps; all ten 5-minute
+segments were FLOOR with no silent second; past the 20-minute mark the user
+confirmed the speaker was still on. In short, **the -49 dBFS floor alone is
+enough here** and the pulse is not needed.
 
-Measured the same way (loopback capture at the endpoint): during a pulse the
-peak rises from **-49 dBFS to -29 dBFS**, about **+20 dB**, with accurate
-periodicity and matching engine log/status fields.
+1.0.5 therefore changes `keepalive_pulse` to default `false`. The pulse stays
+as an option for devices with a genuinely higher level gate.
 
-> **Honest boundary: this is still a hypothesis, not a confirmed fix.** No
-> software here can read the Stanmore II's standby circuit, and no 20-minute
-> controlled run has been completed. Use the A/B procedure below to decide.
+> **Boundary**: one speaker, one long window -- this does not generalise. No
+> software here can read the standby circuit; the local evidence is the
+> combination of Bluetooth PnP presence and a direct user observation. The
+> pulse has never been shown to help, so it should not ship enabled.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `keepalive_pulse` | `true` | Master switch; `false` restores 1.0.2 behaviour for the A/B test |
+| `keepalive_pulse` | `false` | Master switch; set `true` to enable (off by default, see above) |
 | `pulse_interval_s` | `120` | Period, well under the device's idle timeout (Stanmore II: 1200 s) |
 | `pulse_duration_s` | `0.35` | Length of one burst |
 | `pulse_level_dbfs` | `-32` | Peak level, clamped to -70 .. -20 dBFS |
@@ -277,13 +285,15 @@ stream opens). The status tab gained two readouts: **Last output** (how long
 since the last block actually moved, which exposes a green UI on a dead stream)
 and **Standby pulse** (On/Off).
 
-### A 20-minute A/B test
+### A 20-minute A/B test (only if your speaker still sleeps)
 
 1. Power the speaker on, select Bluetooth as its source, play no music or video,
    and leave the Windows volume at its normal level.
-2. Set `keepalive_pulse: false`, restart Fermata, wait **22 minutes**, and look
-   at the indicator lights (all off in standby).
-3. Set `keepalive_pulse: true`, restart, wait another **22 minutes**, look again.
+2. **Leave the default** (`keepalive_pulse: false`), wait **22 minutes**, and
+   look at the indicator lights (all off in standby). This step already passed
+   for 47 m 55 s on the reference machine.
+3. Only if step 2 really slept, set `keepalive_pulse: true`, restart Fermata,
+   and wait another **22 minutes**.
 4. If only step 3 stays awake, the pulse works. If **both** sleep, the level is
    not the cause: check the speaker's selected source, whether a second paired
    Bluetooth device took over as the active source, the absolute volume on both

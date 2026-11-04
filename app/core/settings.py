@@ -23,11 +23,16 @@ DEFAULTS: dict[str, Any] = {
     "signal_type": "pink",
     # dBFS; -60 is inaudible but well above the amp's noise floor
     "level_dbfs": -60.0,
-    # Periodic high-level low-frequency burst. Some speakers judge "nothing is
-    # playing" by signal level rather than by the presence of a stream, so the
-    # inaudible floor alone may not reset their standby timer. Switch off for
-    # an A/B test; see README for the measurement procedure.
-    "keepalive_pulse": True,
+    # Optional periodic high-level low-frequency burst, OFF by default.
+    # It was added on the hypothesis that some speakers gate on decoded level
+    # rather than stream presence. A 47m55s unattended run (2026-11-04,
+    # Marshall Stanmore II over Bluetooth A2DP) falsified that for this device:
+    # the plain -60 dBFS pink floor alone kept the endpoint active, the A2DP
+    # sink present for 2875/2875 s, and the user confirmed the speaker still
+    # on -- no pulse, no watchdog intervention, no data gaps. Keep the option
+    # for devices with a genuinely higher gate, but do not ship an unverified
+    # hypothesis as the default. See README for the A/B procedure.
+    "keepalive_pulse": False,
     "pulse_interval_s": 120.0,
     "pulse_duration_s": 0.35,
     "pulse_level_dbfs": -32.0,

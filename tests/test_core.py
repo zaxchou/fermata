@@ -41,6 +41,9 @@ def check(name, ok, detail=""):
 print("=== settings ===")
 s = settings_mod.load()
 check("load returns all defaults", set(s) == set(settings_mod.DEFAULTS), f"{len(s)} keys")
+check("standby pulse off by default (unverified hypothesis)",
+      settings_mod.DEFAULTS["keepalive_pulse"] is False,
+      str(settings_mod.DEFAULTS["keepalive_pulse"]))
 
 s["level_dbfs"] = -999          # out of range -> clamped
 s["signal_type"] = "bogus"      # invalid enum -> default
