@@ -23,6 +23,15 @@ DEFAULTS: dict[str, Any] = {
     "signal_type": "pink",
     # dBFS; -60 is inaudible but well above the amp's noise floor
     "level_dbfs": -60.0,
+    # Periodic high-level low-frequency burst. Some speakers judge "nothing is
+    # playing" by signal level rather than by the presence of a stream, so the
+    # inaudible floor alone may not reset their standby timer. Switch off for
+    # an A/B test; see README for the measurement procedure.
+    "keepalive_pulse": True,
+    "pulse_interval_s": 120.0,
+    "pulse_duration_s": 0.35,
+    "pulse_level_dbfs": -32.0,
+    "pulse_freq_hz": 90.0,
     # sine only
     "freq_hz": 19000.0,
     # 0 = use the device default
@@ -46,6 +55,12 @@ DEFAULTS: dict[str, Any] = {
 
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "level_dbfs": (-120.0, 0.0),
+    # The pulse is meant to be far louder than the floor but still quiet in
+    # absolute terms; -20 dBFS is the ceiling so a typo cannot blast the room.
+    "pulse_level_dbfs": (-70.0, -20.0),
+    "pulse_interval_s": (10.0, 900.0),
+    "pulse_duration_s": (0.05, 3.0),
+    "pulse_freq_hz": (30.0, 500.0),
     "freq_hz": (20.0, 20000.0),
     "sample_rate": (0, 384000),
     "wait_device_s": (0.0, 86400.0),

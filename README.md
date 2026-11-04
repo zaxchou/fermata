@@ -76,7 +76,7 @@ the author's machine (i7-11700K, 16 threads, Windows 11) as process CPU time ove
 
 | What | Measured |
 |---|---|
-| CPU, audio engine alone (no GUI) | **0.08-0.10%** of one core |
+| CPU, audio engine alone (no GUI) | **0.08-0.10%** of one core (1.0.4 halves the callback rate, see below) |
 | CPU, whole app, tray only | **0.9%** of one core (app 0.24% + WebView2 0.66%) |
 | CPU, whole app, window open | **~3%** of one core (app 0.4% + WebView2 2.8%) |
 
@@ -104,6 +104,42 @@ for memory.
 The honest summary of this table: **the settings window, not the signal, is what
 this costs.** If that trade is wrong for you, a command-line C++ tool is a tenth
 of it — see the comparison further down.
+
+### 1.0.4: the only lever left is callback frequency
+
+Timing the callback body alone at 16384 frames: our own code takes **9.7 us**
+(0.22 us slicing, 8.67 us writing both channels, 1.3 us RMS every second
+block) — **0.0026% of a core** — while the whole engine costs about 0.10%. The
+arithmetic is not the cost; **PortAudio's per-callback scheduling** is. The only
+remaining lever is how often it runs.
+
+Real engine on a spare, non-Bluetooth WASAPI endpoint (48 kHz), two independent
+measurements:
+
+| Block frames | Callbacks / 20 s | Relative CPU (cycle-counted, idle-subtracted) | 60 s process CPU |
+|---|---|---|---|
+| 16384 (before) | 73 | 100% | 0.104% |
+| **32768 (now)** | **37** | **65.0%** | **0.078%** |
+| 65536 | 19 | 40.7% | 0.026% * |
+
+\* 0.026% is exactly **one** 15.6 ms Windows CPU-accounting tick, so it sits at
+the resolution limit: read it as "clearly lower", not as an exact value. The
+cycle counter has no such quantisation and is the ratio to trust. These absolute
+numbers come from a different endpoint, so **do not compare them row-for-row
+with the table above**; what is meaningful is the ratio within one measurement.
+
+**65536 was not chosen.** At 44.1 kHz one block lasts 1.49 s, so the 1.5 s
+fade-out spans three callbacks, a stop can take ~4.5 s (near the 6 s join
+timeout), and the 5 s watchdog would see only 3.4 callback intervals. It was
+not verified on a Bluetooth endpoint. Halving the callback rate takes most of
+the gain while keeping stops near 3 s. The heartbeat also moved from 0.5 s to
+1 s: the window refreshes once a second anyway, and the extra wake-up only
+pulls the CPU out of a deep C-state.
+
+**Keep the scale in mind:** the engine was already ~0.1% of a core, and most of
+the ~0.9% tray total is WebView2. This pass saves 0.02-0.03% of a core and half
+the timer wake-ups. It does not change the table above; it changes how often
+this background process bothers the CPU at all.
 
 ---
 
@@ -146,10 +182,16 @@ sibling; copying the EXE alone will not work.
 | **Closing hides to tray** | Turn this off and the window's X quits the app and stops the stream. |
 | **Language** | *Auto (system)* follows the Windows display language; or pin English / 简体中文. Applies immediately, including the tray menu, without a restart. |
 
-On the level setting: it sets the peak amplitude of the generated waveform, so
-pink and white come out at the same RMS (they are both normalised to uniform
-white noise) and a sine is 1.8 dB louder in RMS terms at the same setting. The
-status tab shows the measured RMS, so you can see what is actually going out.
+On the level setting: it sets the **peak amplitude** of the generated waveform,
+not its RMS. Pink and white therefore share the same RMS (both normalised to
+uniform white noise) at 4.8 dB below the nominal figure, while a sine is 1.8 dB
+louder in RMS terms. A nominal `-60 dBFS` is `-64.8 dBFS` RMS. The status tab
+shows the measured RMS, so you can see what is actually going out.
+
+Measured on a Stanmore II with a WASAPI loopback capture, the continuous floor
+arrives at the endpoint at **-62.3 dBFS RMS / -49.8 dBFS peak**, with the
+session at 100% and unmuted. The signal does arrive; it is simply very quiet,
+which is what the next section addresses.
 
 On the device setting: *Any device (system default)* is resolved **when the
 stream starts**, and again on each reconnect -- not continuously. Switching the
@@ -194,7 +236,65 @@ works on your machine without opening the window and guessing.
 
 To confirm the device really stays awake: run the app, leave the volume at a
 normal level, wait past the device's idle timeout, and check its indicator light
-or connection state.
+or connection state. **This step cannot be skipped.** `--selftest` proves the
+signal reached the endpoint; it cannot prove the speaker's standby circuit
+accepted it.
+
+---
+
+## Standby pulse (since 1.0.4)
+
+Feeding only an inaudible floor rests on an assumption that was never tested:
+that a device judges idleness by the *presence of a stream*. Many judge it by the
+*level of the decoded audio* instead. If that threshold sits above the floor,
+the UI stays green and the frame count keeps climbing while the speaker still
+goes to sleep after 20 minutes -- the worst form of a feature that only looks
+like it works.
+
+1.0.4 therefore adds a **switchable** periodic pulse: on top of the unchanged
+floor, a 0.35 s, -32 dBFS, 90 Hz tone every 120 seconds. 90 Hz sits roughly
+25 dB down on the equal-loudness curve relative to 1 kHz, so the same digital
+level is far less audible; a 30 ms cosine ramp prevents a click.
+
+Measured the same way (loopback capture at the endpoint): during a pulse the
+peak rises from **-49 dBFS to -29 dBFS**, about **+20 dB**, with accurate
+periodicity and matching engine log/status fields.
+
+> **Honest boundary: this is still a hypothesis, not a confirmed fix.** No
+> software here can read the Stanmore II's standby circuit, and no 20-minute
+> controlled run has been completed. Use the A/B procedure below to decide.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `keepalive_pulse` | `true` | Master switch; `false` restores 1.0.2 behaviour for the A/B test |
+| `pulse_interval_s` | `120` | Period, well under the device's idle timeout (Stanmore II: 1200 s) |
+| `pulse_duration_s` | `0.35` | Length of one burst |
+| `pulse_level_dbfs` | `-32` | Peak level, clamped to -70 .. -20 dBFS |
+| `pulse_freq_hz` | `90` | Low tone, clamped to 30 .. 500 Hz |
+
+Restart Fermata after editing `settings.json` (the burst is built when the
+stream opens). The status tab gained two readouts: **Last output** (how long
+since the last block actually moved, which exposes a green UI on a dead stream)
+and **Standby pulse** (On/Off).
+
+### A 20-minute A/B test
+
+1. Power the speaker on, select Bluetooth as its source, play no music or video,
+   and leave the Windows volume at its normal level.
+2. Set `keepalive_pulse: false`, restart Fermata, wait **22 minutes**, and look
+   at the indicator lights (all off in standby).
+3. Set `keepalive_pulse: true`, restart, wait another **22 minutes**, look again.
+4. If only step 3 stays awake, the pulse works. If **both** sleep, the level is
+   not the cause: check the speaker's selected source, whether a second paired
+   Bluetooth device took over as the active source, the absolute volume on both
+   ends, and whether Fermata is still running in the tray at all.
+5. If you can hear the pulse, lower `pulse_level_dbfs` by 5 dB and retest to
+   find the quietest level that still works.
+
+1.0.4 also adds a **stall watchdog**: if the frame counter stops advancing for
+5 seconds the stream is declared dead and rebuilt, and the endpoint is
+re-validated every 10 seconds. Previously a Bluetooth link that dropped without
+raising left the UI showing "running" indefinitely.
 
 ---
 
@@ -244,12 +344,28 @@ Fermata first (the single-instance guard would otherwise refuse the instance
 under test), and the EXE suite puts your Run key back the way it found it.
 
 ```
-python tests\test_core.py    # 35 checks: settings, autostart, devices, signal
-                             # spectrum, loop periodicity and level, engine
-                             # lifecycle
+python tests\test_core.py    # 65 checks: settings, autostart, devices, signal
+                             # spectrum, loop periodicity and level, pulse,
+                             # cross-block fades, engine lifecycle
 python tests\test_gui.py     #  9 checks: window, tray, log, single-instance
 python tests\test_exe.py     # 15 checks: packaged EXE acceptance
 ```
+
+**Do not run the tests blindly while the default output is being measured.**
+The lifecycle check in `test_core.py` and the packaged `--selftest` use the
+system default output by default, which opens a *second* stream on the same
+speaker, raises its level and invalidates whatever is being measured. Point
+them at a spare endpoint instead (a case-insensitive substring of its name):
+
+```
+set FERMATA_TEST_DEVICE_HINT=KKL
+python tests\test_core.py
+Fermata.exe --selftest
+```
+
+`test_gui.py` and `test_exe.py` **stop every running Fermata** first (the
+single-instance guard requires it), so do not run those while the app is
+protecting a speaker.
 
 `test_exe.py` needs a build; it runs the EXE's own `--selftest`, launches the
 GUI, sends a real `WM_CLOSE` to the window to prove that clicking the X hides to
@@ -289,6 +405,12 @@ thread before touching PortAudio. Without it, the packaged app streams nothing.
 
 - **Windows only.** The COM initialization and the Run-key autostart are both
   Windows-specific, and the tests assume Windows.
+- **The app has to actually be running.** With launch-at-login off, a reboot or
+  a sleep/wake cycle does not bring Fermata back, and the device will go to
+  standby during that gap. Whether it should be resident is your call; the app
+  will not change that setting behind your back. Every launch writes
+  `window created` to `%APPDATA%\Fermata\logs\app.log`, which is the easiest way
+  to check.
 - **Keep the volume at a normal level.** Most amplifiers decide standby before
   the volume control, but this is not universally documented, so a volume knob at
   zero is untested territory.

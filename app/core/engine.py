@@ -27,14 +27,43 @@ import numpy as np
 import sounddevice as sd
 
 FADE_S = 1.5
-# Blocks of 16384 frames -- 341 ms at 48 kHz. PortAudio's per-period overhead is
-# paid once per block, and it is not small: measured over 60 s windows, an empty
-# callback costs 0.39% of a core at 4096 frames against 0.05% at 16384. Latency
-# is the only thing a bigger block costs, and a signal nobody is listening to
-# does not care about latency. Measured on the real engine: 4096 -> 0.21/0.31%,
-# 16384 -> 0.08/0.10% of a core.
-BLOCK_FRAMES = 16384
-HEARTBEAT_POLL_S = 0.5
+# PortAudio charges its per-period overhead once per callback, and our own
+# callback body is almost free: measured at 16384 frames it is 9.7 us of work
+# (0.22 us slicing, 8.67 us writing both channels, 1.3 us RMS every 2nd block),
+# i.e. 0.0026% of a core against ~0.10% for the whole engine. So the only lever
+# left is *how often* the callback runs, not what it does.
+#
+# Two independent measurements on a spare WASAPI endpoint, real engine running:
+#   * 60 s process-CPU windows: 16384 -> 0.104%, 32768 -> 0.078%,
+#     65536 -> 0.026% of a core. The last figure is a single 15.6 ms accounting
+#     tick, so it sits at the resolution limit and must not be read as exact.
+#   * 20 s QueryProcessCycleTime windows, idle-subtracted, relative to 16384:
+#     100% / 65.0% / 40.7%, with 73 / 37 / 19 callbacks per 20 s. This has no
+#     15.6 ms quantisation and is the number to trust for the *ratio*.
+#
+# 65536 is deliberately not used. At 44.1 kHz one block is 1.49 s, so the 1.5 s
+# fade-out has to span three callbacks: a stop can then take ~4.5 s, close to
+# the 6 s join timeout, and the 5 s watchdog would only see 3.4 callback
+# intervals. It was not verified on a Bluetooth endpoint. Halving the callback
+# rate (32768 = 743 ms at 44.1 kHz) keeps stops near 3 s and the watchdog well
+# inside its margin for a gain that is already down in the noise floor.
+BLOCK_FRAMES = 32768
+# The window refreshes once a second, so updating engine stats twice as fast
+# produced numbers nobody could see. One wake-up per second also halves the
+# number of timer expirations that pull the CPU out of a deep C-state -- the
+# real cost here is wake-ups, not the microseconds spent inside the loop.
+# Worst-case stall detection becomes STALL_TIMEOUT_S + 1 s, still well inside
+# any plausible speaker standby timer.
+HEARTBEAT_POLL_S = 1.0
+# A live stream delivers a block every ~0.74 s (32768 frames at 44.1 kHz).
+# If the frame counter stops advancing, PortAudio has quietly stopped calling
+# us -- a Bluetooth link going down without raising is the usual cause. Without
+# this check the UI keeps reporting "running" on a dead stream, which is the
+# one failure a keepalive tool must never hide.
+STALL_TIMEOUT_S = 5.0
+# Re-validate the endpoint now and then: a Bluetooth reconnect can change the
+# device index out from under an already open stream.
+DEVICE_CHECK_S = 10.0
 
 # Output RMS of the noise signals at unit amplitude. Uniform white noise drawn
 # from [-1, 1) has RMS 1/sqrt(3), and pink is normalised to the same figure so
@@ -237,6 +266,71 @@ def dbfs_to_amplitude(dbfs: float) -> float:
 
 
 # --------------------------------------------------------------------------
+# standby pulse
+# --------------------------------------------------------------------------
+
+# The continuous floor is deliberately inaudible. Some speakers decide "nothing
+# is playing" from the *level* of the decoded audio rather than from the mere
+# presence of an A2DP stream, so an inaudible floor alone may leave the standby
+# timer running. A short burst at a much higher level clears any plausible
+# detection threshold; a low tone sits ~25 dB down on the equal-loudness curve
+# and a cosine ramp keeps it from clicking, so the burst costs almost nothing
+# in perceived noise.
+#
+# This is an explicit, switchable hypothesis. No measurement here proves what
+# any particular speaker's standby circuit does, so every parameter is exposed
+# as a setting and the whole mechanism can be disabled for an A/B test.
+def _build_pulse(sample_rate: int, settings: dict[str, Any]) -> np.ndarray:
+    """One periodic high-level low-frequency burst, pre-scaled and ready."""
+    duration = float(settings.get("pulse_duration_s", 0.35))
+    level = dbfs_to_amplitude(float(settings.get("pulse_level_dbfs", -32.0)))
+    freq = float(settings.get("pulse_freq_hz", 90.0))
+    n = max(1, int(sample_rate * duration))
+    t = np.arange(n, dtype=np.float64) / sample_rate
+    wave = np.sin(2.0 * np.pi * freq * t)
+    fade = min(int(sample_rate * 0.03), n // 2)
+    if fade > 0:
+        env = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade) / fade)
+        wave[:fade] *= env
+        wave[-fade:] *= env[::-1]
+    return (wave * level).astype(np.float32)
+
+
+def _mix_pulse(outdata: np.ndarray, start_frame: int,
+               pulse: np.ndarray, period_frames: int) -> None:
+    """Add the burst if any part of this block overlaps a pulse window.
+
+    Called on every block, so the hot path is two integer comparisons when
+    there is no overlap (the overwhelming majority). `start_frame` is the
+    stream's cumulative frame count at the beginning of this block.
+    """
+    length = len(pulse)
+    pos = start_frame % period_frames
+    for begin in (-pos, period_frames - pos):
+        if begin >= len(outdata):
+            continue
+        i0 = max(0, begin)
+        i1 = min(len(outdata), begin + length)
+        if i1 <= i0:
+            continue
+        chunk = pulse[i0 - begin:i1 - begin]
+        outdata[i0:i1, 0] += chunk
+        if outdata.shape[1] > 1:
+            outdata[i0:i1, 1] += chunk
+
+
+def _device_still_here(index: int, name: str) -> bool:
+    """Cheap liveness check for the endpoint an open stream is bound to."""
+    try:
+        dev = sd.query_devices(index)
+    except Exception:
+        return False
+    if dev.get("max_output_channels", 0) < 1:
+        return False
+    return not name or dev.get("name", "") == name
+
+
+# --------------------------------------------------------------------------
 # device discovery
 # --------------------------------------------------------------------------
 
@@ -372,8 +466,12 @@ def pick_device(hint: str) -> tuple[int, dict] | None:
                 return tier, idx
         return len(_API_ORDER), idx
 
-    best = min(rank(i)[0] for i, _ in matches)
-    pool = [(i, d) for i, d in matches if rank(i)[0] == best]
+    # Resolve each host API exactly once. Calling rank() separately for the
+    # minimum and for the pool re-enumerated the device list for every match
+    # twice -- pure waste on the reconnect path, where this runs repeatedly.
+    ranked = [(rank(i)[0], i, d) for i, d in matches]
+    best = min(tier for tier, _i, _d in ranked)
+    pool = [(i, d) for tier, i, d in ranked if tier == best]
     if len(pool) == 1:
         return pool[0]
 
@@ -600,6 +698,10 @@ class KeepaliveEngine:
         gen = NoiseGenerator(str(settings.get("signal_type", "pink")),
                              sample_rate, float(settings.get("freq_hz", 19000.0)),
                              amplitude)
+        pulse = (_build_pulse(sample_rate, settings)
+                 if settings.get("keepalive_pulse", True) else None)
+        pulse_period = (max(1, int(round(float(settings.get("pulse_interval_s", 120.0))
+                                         * sample_rate))) if pulse is not None else 0)
 
         fade_in = np.linspace(0.0, 1.0, int(sample_rate * FADE_S),
                               dtype=np.float32)
@@ -623,6 +725,8 @@ class KeepaliveEngine:
             outdata[:, 0] = block
             if channels == 2:
                 outdata[:, 1] = block
+            if pulse is not None:
+                _mix_pulse(outdata, st["frames"], pulse, pulse_period)
 
             finishing = False
             if st["fading_out"]:
@@ -666,8 +770,13 @@ class KeepaliveEngine:
         self._log(f"streaming on #{device_index} '{info.get('name')}' "
                   f"[{host}] {sample_rate}Hz {channels}ch "
                   f"{settings.get('signal_type')} @ "
-                  f"{settings.get('level_dbfs')} dBFS")
+                  f"{settings.get('level_dbfs')} dBFS"
+                  + (f" + pulse {settings.get('pulse_level_dbfs', -32.0):g} dBFS"
+                     f"/{settings.get('pulse_freq_hz', 90.0):g}Hz"
+                     f"/{settings.get('pulse_interval_s', 120.0):g}s"
+                     if pulse is not None else " (no pulse)"))
 
+        reason = "stopped"
         try:
             with sd.OutputStream(device=device_index, samplerate=sample_rate,
                                  channels=channels, dtype="float32",
@@ -681,14 +790,44 @@ class KeepaliveEngine:
                                 signal_type=settings.get("signal_type"),
                                 level_dbfs=settings.get("level_dbfs"),
                                 audio_rms=0.0,
-                                frames_delivered=0)
+                                frames_delivered=0,
+                                last_output_age_s=0.0,
+                                pulse_enabled=pulse is not None)
+                # Watchdog state. Only armed once the stream has actually
+                # delivered a block: a Bluetooth endpoint can take a moment to
+                # start calling back, and that is not a stall.
+                last_frames = -1
+                last_progress = time.monotonic()
+                next_dev_check = last_progress + DEVICE_CHECK_S
                 while not stop_event.is_set():
                     if stop_event.wait(HEARTBEAT_POLL_S):
                         break
-                    self._set_stats(frames_delivered=st["frames"],
+                    now = time.monotonic()
+                    frames_now = st["frames"]
+                    if frames_now != last_frames:
+                        last_frames = frames_now
+                        last_progress = now
+                    elif last_frames > 0 and now - last_progress >= STALL_TIMEOUT_S:
+                        reason = (f"no audio frames for "
+                                  f"{now - last_progress:.1f}s")
+                        self._log(f"stream stalled ({reason}); rebuilding")
+                        self._set_state(STATE_RECONNECTING, reason)
+                        break
+
+                    if now >= next_dev_check:
+                        next_dev_check = now + DEVICE_CHECK_S
+                        if not _device_still_here(device_index,
+                                                  str(info.get("name", ""))):
+                            reason = "output endpoint disappeared"
+                            self._log(f"{reason}; rebuilding the stream")
+                            self._set_state(STATE_RECONNECTING, reason)
+                            break
+
+                    self._set_stats(frames_delivered=frames_now,
                                     audio_rms=st["rms"],
-                                    stream_errors=st["errors"])
-            return "stopped"
+                                    stream_errors=st["errors"],
+                                    last_output_age_s=round(now - last_progress, 1))
+            return reason
         except sd.CallbackStop:
             return "stopped"
         except Exception as exc:

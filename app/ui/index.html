@@ -242,6 +242,10 @@
                <div class="v mono" id="s-frames">—</div></div>
           <div><div class="k" data-i18n="st.errors"></div>
                <div class="v mono" id="s-errors">—</div></div>
+          <div><div class="k" data-i18n="st.lastout"></div>
+               <div class="v mono" id="s-lastout">—</div></div>
+          <div><div class="k" data-i18n="st.pulse"></div>
+               <div class="v mono" id="s-pulse">—</div></div>
         </div>
       </div>
       <div class="card">
@@ -433,6 +437,8 @@ const I18N = {
     'btn.save':'Save settings','btn.openFolder':'Open data folder',
     'st.device':'Device','st.uptime':'Uptime','st.signal':'Signal',
     'st.level':'Audio level','st.frames':'Frames sent','st.errors':'Errors',
+    'st.lastout':'Last output','st.pulse':'Standby pulse',
+    'st.pulseOn':'On','st.pulseOff':'Off',
     'state.running':'Active','state.waiting':'Waiting for device',
     'state.reconnecting':'Reconnecting','state.error':'Error','state.stopped':'Stopped',
     'detail.running':'Feeding the device a signal you cannot hear.',
@@ -476,6 +482,8 @@ const I18N = {
     'btn.save':'保存设置','btn.openFolder':'打开数据目录',
     'st.device':'设备','st.uptime':'运行时长','st.signal':'信号',
     'st.level':'音频电平','st.frames':'已发送帧数','st.errors':'错误',
+    'st.lastout':'最近输出','st.pulse':'保活脉冲',
+    'st.pulseOn':'开','st.pulseOff':'关',
     'state.running':'运行中','state.waiting':'等待设备',
     'state.reconnecting':'重连中','state.error':'出错','state.stopped':'已停止',
     'detail.running':'正在向设备输出听不见的信号。',
@@ -563,6 +571,15 @@ function paintStatus(){
     ? st.audio_rms.toFixed(6) + '  (' + Number(st.level_dbfs).toFixed(0) + ' dBFS)' : '—';
   $('s-frames').textContent = st.running ? fmtNum(st.frames_delivered) : '—';
   $('s-errors').textContent = st.running ? fmtNum(st.stream_errors || 0) : '—';
+  // The frame counter is only meaningful if it is still moving. Showing the
+  // age of the last delivered block makes a silently dead stream visible
+  // instead of leaving a green "running" pill with a frozen number.
+  const age = Number(st.last_output_age_s);
+  $('s-lastout').textContent = st.running && isFinite(age)
+    ? (age < 1 ? '<1 s' : age.toFixed(1) + (lang === 'zh' ? ' 秒前' : ' s ago'))
+    : '—';
+  $('s-pulse').textContent = st.pulse_enabled
+    ? t('st.pulseOn') : t('st.pulseOff');
 
   $('btnToggle').textContent = st.running ? t('btn.stop') : t('btn.start');
   $('btnToggle').className = 'btn ' + (st.running ? 'danger' : 'primary');

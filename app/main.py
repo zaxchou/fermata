@@ -45,7 +45,8 @@ ERROR_ALREADY_EXISTS = 183
 # Settings that change what comes out of the speaker. Everything else (language,
 # tray behaviour, autostart) can be applied without interrupting the stream.
 AUDIO_KEYS = ("device_hint", "signal_type", "level_dbfs", "freq_hz",
-              "sample_rate")
+              "sample_rate", "keepalive_pulse", "pulse_interval_s",
+              "pulse_duration_s", "pulse_level_dbfs", "pulse_freq_hz")
 
 log = logging.getLogger("fermata")
 
@@ -144,7 +145,7 @@ class Api:
 # --------------------------------------------------------------------------
 
 class Application:
-    version = "1.0.2"
+    version = "1.0.4"
 
     def __init__(self, start_minimized: bool = False):
         self.settings = settings_mod.load()
@@ -448,6 +449,11 @@ def selftest() -> int:
 
     cfg = settings_mod.load()
     # The stored device filter is used as-is; empty means the system default.
+    # An explicit override lets the packaged self-test run against a spare
+    # endpoint while the default one is being measured by something else.
+    hint = os.environ.get("FERMATA_TEST_DEVICE_HINT")
+    if hint:
+        cfg["device_hint"] = hint
     cfg["wait_device_s"] = 30
     cfg["reconnect"] = False
     eng = KeepaliveEngine(log=lambda m: lines.append(f"    engine: {m}"))
@@ -488,6 +494,10 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+    # The frozen EXE carries no file-version resource, so the log is the only
+    # reliable way to tell which build is actually running on a machine that
+    # has been upgraded by copying files around. Write it on every code path.
+    log.info("Fermata %s starting (pid %d)", Application.version, os.getpid())
 
     if args.selftest:
         return selftest()
