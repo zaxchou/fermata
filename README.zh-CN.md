@@ -12,7 +12,7 @@ Fermata 是一个 Windows 托盘小工具。它持续向音箱、DAC 或蓝牙�
 
 ## 界面截图
 
-Fermata 1.0.5 在 Windows 11 上的实际运行画面，输出设备为 Marshall Stanmore II。此处为英文界面；程序内置简体中文，可在「App → Language」中切换。
+Fermata 在 Windows 11 上的实际运行画面，输出设备为 Marshall Stanmore II。此处为英文界面；程序内置简体中文，可在「App → Language」中切换。截图拍于 1.0.5 构建；1.0.6 的界面代码与之完全相同，唯一差别是「应用」页底部显示的版本号字段。
 
 ![状态页：Active、−60 dBFS 粉红噪声、保活脉冲关闭](docs/screenshots/status.png)
 

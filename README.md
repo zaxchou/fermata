@@ -16,9 +16,11 @@ has been idle long enough to power down.
 
 ## Screenshots
 
-Fermata 1.0.5 running on Windows 11, feeding a Marshall Stanmore II. The UI is
+Fermata running on Windows 11, feeding a Marshall Stanmore II. The UI is
 shown in English here; it also ships with a Simplified Chinese translation,
-switchable under **App → Language**.
+switchable under **App → Language**. These are real screenshots of the 1.0.5
+build; the 1.0.6 interface is unchanged, the only difference being the version
+string shown at the bottom of the **App** tab.
 
 ![Status panel: Active, pink noise at -60 dBFS, standby pulse off](docs/screenshots/status.png)
 
