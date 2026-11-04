@@ -173,8 +173,9 @@ After that:
 
 - **Closing the window keeps it running.** It lives in the tray; use *Quit* in
   the tray menu to actually exit.
-- The **tray icon colour is the status**: green = feeding, amber = waiting or
-  reconnecting, red = error, grey = stopped.
+- The **tray icon's dot colour is the status**: green = feeding, amber =
+  waiting or reconnecting, red = error, grey = stopped. The dark rounded square
+  around it is the same mark you see in the window header.
 - Tick **Launch at login** and it starts by itself, minimized to the tray.
 
 It is a folder build, so move the whole folder. The EXE needs its `_internal`

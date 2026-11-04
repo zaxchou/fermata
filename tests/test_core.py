@@ -21,7 +21,7 @@ os.environ["FERMATA_DATA_DIR"] = _TMP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.core import autostart, settings as settings_mod
+from app.core import autostart, icon as icon_mod, settings as settings_mod
 from app.core.engine import (NOISE_RMS, _API_ORDER, _build_pulse,
                              _device_still_here, _is_hands_free, _mix_pulse,
                              KeepaliveEngine, NoiseGenerator,
@@ -37,6 +37,39 @@ def check(name, ok, detail=""):
     results.append((name, ok))
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
 
+
+print("=== icon ===")
+# The icon is the UI's header mark, not the old speaker glyph. Pin the shape,
+# the state-coloured dot and the 150deg gradient so it cannot drift back.
+im = icon_mod.make_image(64, icon_mod.MARK_GREEN)
+check("icon is a square RGBA image", im.size == (64, 64) and im.mode == "RGBA",
+      f"{im.size} {im.mode}")
+check("icon has transparent rounded corners",
+      all(im.getpixel(p)[3] <= 8 for p in [(0, 0), (63, 0), (0, 63), (63, 63)]))
+check("icon square body is opaque", im.getpixel((32, 4))[3] > 128,
+      str(im.getpixel((32, 4))))
+dot = im.getpixel((32, 32))[:3]
+check("centre dot takes the state colour",
+      all(abs(dot[i] - icon_mod.MARK_GREEN[i]) <= 2 for i in range(3)), str(dot))
+tl, br = im.getpixel((16, 16))[:3], im.getpixel((48, 48))[:3]
+check("gradient darkens toward the top-left", sum(tl) < sum(br),
+      f"{tl} -> {br}")
+check("running dot matches the UI live green",
+      icon_mod.STATE_COLORS["running"] == (74, 222, 128, 255))
+_colours = {tuple(v) for v in icon_mod.STATE_COLORS.values()}
+check("five states, four colours (waiting/reconnecting share amber)",
+      len(icon_mod.STATE_COLORS) == 5 and len(_colours) == 4
+      and icon_mod.STATE_COLORS["waiting"] == icon_mod.STATE_COLORS["reconnecting"],
+      f"{len(icon_mod.STATE_COLORS)} states / {len(_colours)} colours")
+from PIL import Image  # noqa: E402  (only needed for the .ico check)
+with tempfile.TemporaryDirectory(prefix="fermata_ico_") as _d:
+    _p = os.path.join(_d, "icon.ico")
+    _ok = icon_mod.write_ico(_p)
+    _sizes = sorted(Image.open(_p).info["sizes"]) if _ok else []
+    check("generated .ico has all seven sizes",
+          _ok and _sizes == [(16, 16), (24, 24), (32, 32), (48, 48),
+                             (64, 64), (128, 128), (256, 256)], str(_sizes))
+print()
 
 print("=== settings ===")
 s = settings_mod.load()
