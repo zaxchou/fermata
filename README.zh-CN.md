@@ -10,6 +10,18 @@ Fermata 是一个 Windows 托盘小工具。它持续向音箱、DAC 或蓝牙�
 
 ---
 
+## 界面截图
+
+Fermata 1.0.5 在 Windows 11 上的实际运行画面，输出设备为 Marshall Stanmore II。此处为英文界面；程序内置简体中文，可在「App → Language」中切换。
+
+![状态页：Active、−60 dBFS 粉红噪声、保活脉冲关闭](docs/screenshots/status.png)
+
+| 声音 | 行为 | 应用 |
+| :---: | :---: | :---: |
+| ![声音设置](docs/screenshots/audio.png) | ![行为设置](docs/screenshots/behaviour.png) | ![应用设置](docs/screenshots/app.png) |
+
+---
+
 ## 要解决的问题
 
 很多音频硬件在静音一段时间后会自行关闭：蓝牙音箱断连、USB DAC 休眠并在唤醒时爆音、Soundbar 切换输入源。其中不少设备的计时器**根本没有关闭开关**。

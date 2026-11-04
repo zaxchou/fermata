@@ -14,6 +14,20 @@ has been idle long enough to power down.
 
 ---
 
+## Screenshots
+
+Fermata 1.0.5 running on Windows 11, feeding a Marshall Stanmore II. The UI is
+shown in English here; it also ships with a Simplified Chinese translation,
+switchable under **App → Language**.
+
+![Status panel: Active, pink noise at -60 dBFS, standby pulse off](docs/screenshots/status.png)
+
+| Audio | Behaviour | App |
+| :---: | :---: | :---: |
+| ![Audio settings](docs/screenshots/audio.png) | ![Behaviour settings](docs/screenshots/behaviour.png) | ![App settings](docs/screenshots/app.png) |
+
+---
+
 ## The problem
 
 Plenty of audio hardware shuts itself off after a stretch of silence: Bluetooth
